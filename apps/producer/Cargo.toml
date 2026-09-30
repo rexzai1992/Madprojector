@@ -1,0 +1,15 @@
+[package]
+name = "mapforge-producer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+mapforge-core = { path = "../../crates/mapforge-core" }
+rfd.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

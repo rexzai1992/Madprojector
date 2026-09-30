@@ -1,0 +1,4 @@
+/target/
+/dist/
+*.mapforge.json.tmp
+.DS_Store

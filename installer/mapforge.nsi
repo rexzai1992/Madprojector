@@ -9,7 +9,8 @@ Unicode true
 !ifndef VERSION
   !define VERSION "0.1.0"
 !endif
-!define DIST "${__FILEDIR__}\..\dist"
+; makensis works from this script's folder, so dist\ is one level up.
+!define DIST "..\dist"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\MapForge"
 
 Name "MapForge ${VERSION}"

@@ -1,5 +1,159 @@
-<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#111827"><title>MapForge Control</title><style>
-body{font-family:system-ui;background:#090d16;color:#edf2ff;margin:0;padding:24px;max-width:700px}h1{font-size:24px}#status{padding:14px;background:#151c2d;border-radius:12px;margin:16px 0}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}button{font:inherit;font-weight:700;padding:20px;border:0;border-radius:12px;background:#246bfe;color:white}button.stop{background:#d43d51}button.dark{background:#282f40}input{width:100%;margin:24px 0}small{color:#9ca8bf}
-</style></head><body><h1>MapForge Live Control</h1><div id="status">Connecting…</div><div class="grid"><button onclick="send('play')">▶ Play</button><button class="dark" onclick="send('pause')">Ⅱ Pause</button><button class="stop" onclick="send('stop')">■ Stop</button><button class="dark" onclick="toggleMute()">Mute / Unmute</button><button class="stop" onclick="send('blackout')">Blackout</button><button onclick="send('restore')">Restore</button></div><label>Master volume</label><input type="range" min="0" max="1" step=".01" value="1" oninput="send('volume/'+this.value)"><small>This page talks only to the Player on your private network.</small><script>
-let state={}; async function send(p){await fetch('/api/'+p,{method:'POST'});refresh()} function toggleMute(){send(state.muted?'unmute':'mute')} async function refresh(){try{state=await(await fetch('/api/state')).json();document.querySelector('#status').textContent=`${state.transport.toUpperCase()} · Volume ${Math.round(state.volume*100)}% · ${state.muted?'MUTED':'Audio on'} · ${state.blackout?'BLACKOUT':'Output live'}`}catch(e){document.querySelector('#status').textContent='Player offline'}} setInterval(refresh,1000);refresh();
-</script></body></html>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#090d16">
+<title>MapForge Control</title>
+<style>
+:root { --accent: #246bfe; --columns: 2; }
+* { box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; background: #090d16; color: #edf2ff; margin: 0 auto; padding: 20px 16px 40px; max-width: 900px; -webkit-user-select: none; user-select: none; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+#note { color: #9ca8bf; margin: 0 0 12px; white-space: pre-wrap; }
+#status { padding: 14px; background: #151c2d; border-radius: 12px; margin: 12px 0 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.dot { width: 12px; height: 12px; border-radius: 50%; background: #d43d51; flex: none; }
+.dot.playing { background: #1f9d62; } .dot.paused { background: #f0aa28; } .dot.ready { background: var(--accent); } .dot.stopped { background: #6b7280; }
+.grid { display: grid; grid-template-columns: repeat(var(--columns), 1fr); gap: 12px; }
+h2 { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: #9ca8bf; margin: 24px 0 10px; }
+button { font: inherit; font-weight: 700; padding: 20px 14px; border: 0; border-radius: 12px; background: var(--accent); color: white; min-height: 64px; touch-action: manipulation; }
+button:active { filter: brightness(1.25); transform: scale(.98); }
+button.dark { background: #282f40; } button.stop { background: #d43d51; } button.on { outline: 3px solid white; }
+.scene { background: #1c2436; text-align: left; display: flex; gap: 10px; align-items: center; }
+.scene.live { outline: 3px solid #1f9d62; }
+.scene b { font-size: 12px; opacity: .7; min-width: 28px; }
+.scene-group { display: contents; }
+.cue { background: #151c2d; border: 1px solid #2a3550; font-weight: 600; min-height: 52px; padding: 12px; text-align: left; }
+.cue::before { content: "◆ "; color: #f0aa28; }
+.cue b { font-size: 11px; opacity: .7; margin-right: 6px; }
+.loop::before { content: "⟲ "; color: #4fd1c5; }
+.loop.live { outline: 3px solid #4fd1c5; }
+.cue small { color: #9ca8bf; font-weight: 500; }
+#exit-loop { width: 100%; margin: 0 0 16px; background: #0f766e; font-size: 18px; }
+input[type=range] { width: 100%; height: 36px; accent-color: var(--accent); }
+.hidden { display: none; }
+small { color: #9ca8bf; display: block; margin-top: 28px; }
+</style>
+</head>
+<body>
+<h1 id="title">MapForge Live Control</h1>
+<p id="note" class="hidden"></p>
+<div id="status"><span class="dot"></span><span id="status-text">Connecting…</span></div>
+
+<button id="exit-loop" class="hidden" onclick="send('release')">Exit loop ⏭</button>
+
+<section id="transport">
+  <div class="grid">
+    <button onclick="send('play')">▶ Play</button>
+    <button class="dark" onclick="send('pause')">Ⅱ Pause</button>
+    <button class="stop" onclick="send('stop')">■ Stop</button>
+    <button class="dark" id="mute" onclick="send(state.muted ? 'unmute' : 'mute')">Mute</button>
+  </div>
+</section>
+
+<section id="scenes-section">
+  <h2>Scenes</h2>
+  <div id="scenes" class="grid"></div>
+</section>
+
+<section id="cues-section" class="hidden">
+  <h2>◆ Cues</h2>
+  <div id="cues" class="grid"></div>
+</section>
+
+<section id="loops-section" class="hidden">
+  <h2>⟲ Loops</h2>
+  <div id="loops" class="grid"></div>
+</section>
+
+<section id="blackout-section">
+  <h2>Output</h2>
+  <div class="grid">
+    <button class="stop" id="blackout" onclick="send('blackout')">Blackout</button>
+    <button onclick="send('restore')">Restore</button>
+  </div>
+</section>
+
+<section id="volume-section">
+  <h2>Master volume <span id="volume-value"></span></h2>
+  <input id="volume" type="range" min="0" max="1" step=".01" value="1">
+</section>
+
+<small>This page talks only to the Player on your private network.</small>
+
+<script>
+let state = {};
+let controller = { settings: {}, scenes: [] };
+let dragging = false;
+const $ = (id) => document.getElementById(id);
+const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+async function send(path) {
+  try { await fetch('/api/' + path, { method: 'POST' }); } catch (e) {}
+  refresh();
+}
+
+const volume = $('volume');
+volume.addEventListener('input', () => { dragging = true; $('volume-value').textContent = Math.round(volume.value * 100) + '%'; send('volume/' + volume.value); });
+volume.addEventListener('change', () => { dragging = false; });
+
+function applySettings() {
+  const s = controller.settings;
+  document.title = s.title || 'MapForge Control';
+  $('title').textContent = s.title || 'MapForge Live Control';
+  $('note').textContent = s.note || '';
+  $('note').classList.toggle('hidden', !s.note);
+  if (s.accent) document.documentElement.style.setProperty('--accent', rgb(s.accent));
+  document.documentElement.style.setProperty('--columns', s.columns || 2);
+  $('transport').classList.toggle('hidden', s.show_transport === false);
+  $('scenes-section').classList.toggle('hidden', s.show_scenes === false || controller.scenes.length === 0);
+  $('blackout-section').classList.toggle('hidden', s.show_blackout === false);
+  $('volume-section').classList.toggle('hidden', s.show_volume === false);
+  const scenes = controller.scenes;
+  const many = scenes.length > 1;
+  const color = (c) => c ? 'background:' + rgb(c) : '';
+  const key = (k) => k ? '<b>' + esc(k) + '</b>' : '';
+  // Scene name in front of cue and loop labels when the show has several scenes.
+  const owner = (scene) => many ? `<small>${esc(scene.label)} ›</small> ` : '';
+  $('scenes').innerHTML = scenes.map((scene) =>
+    `<button class="scene${scene.id === state.scene_id ? ' live' : ''}" style="${color(scene.color)}" onclick="send('scene/${scene.index}')">` +
+    `${key(scene.hotkey)}${esc(scene.label)}</button>`).join('');
+  const cues = scenes.flatMap((scene) => (scene.cues || []).map((cue) =>
+    `<button class="cue" style="${color(cue.color)}" onclick="send('cue/${scene.index}/${cue.index}')">` +
+    `${key(cue.hotkey)}${owner(scene)}${esc(cue.label)}</button>`));
+  const loops = scenes.flatMap((scene) => (scene.loops || []).map((loop) =>
+    `<button class="cue loop${state.loop_name === loop.name ? ' live' : ''}" style="${color(loop.color)}" onclick="send('loop/${scene.index}/${loop.index}')">` +
+    `${key(loop.hotkey)}${owner(scene)}${esc(loop.label)}</button>`));
+  $('cues').innerHTML = cues.join('');
+  $('loops').innerHTML = loops.join('');
+  $('cues-section').classList.toggle('hidden', s.show_scenes === false || cues.length === 0);
+  $('loops-section').classList.toggle('hidden', s.show_scenes === false || loops.length === 0);
+}
+
+async function refresh() {
+  try {
+    state = await (await fetch('/api/state')).json();
+    controller = await (await fetch('/api/controller')).json();
+    const t = state.transport;
+    document.querySelector('.dot').className = 'dot ' + t;
+    $('status-text').textContent = `${t.toUpperCase()} · ${state.blackout ? 'BLACKOUT' : 'Output live'} · ${state.muted ? 'Muted' : 'Volume ' + Math.round(state.volume * 100) + '%'}`;
+    const offline = (state.followers || []).filter((f) => !f.online);
+    if (offline.length) $('status-text').textContent += ` · ⚠ OFFLINE: ${offline.map((f) => f.address.split(':')[0]).join(', ')}`;
+    else if ((state.followers || []).length) $('status-text').textContent += ` · All ${state.followers.length + 1} PCs online`;
+    $('mute').textContent = state.muted ? 'Unmute' : 'Mute';
+    $('exit-loop').classList.toggle('hidden', !state.loop_name);
+    if (state.loop_name) $('exit-loop').textContent = `Exit loop “${state.loop_name}” ⏭`;
+    $('blackout').classList.toggle('on', state.blackout);
+    if (!dragging) { volume.value = state.volume; $('volume-value').textContent = Math.round(state.volume * 100) + '%'; }
+    applySettings();
+  } catch (e) {
+    document.querySelector('.dot').className = 'dot';
+    $('status-text').textContent = 'Player offline';
+  }
+}
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>

@@ -2661,12 +2661,17 @@ impl ProducerApp {
                 ui.add(egui::TextEdit::singleline(&mut output.name).desired_width(170.0));
                 ui.end_row();
                 ui.label("Player PC");
-                ui.add(
-                    egui::TextEdit::singleline(&mut output.player)
-                        .desired_width(170.0)
-                        .hint_text("192.168.1.50"),
-                )
-                .on_hover_text("IP address of the PC this projector is plugged into (port 4777)");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut output.player)
+                            .desired_width(120.0)
+                            .hint_text("192.168.1.50"),
+                    )
+                    .on_hover_text(
+                        "IP address of the PC this projector is plugged into (port 4777)",
+                    );
+                    this_pc_button(ui, &mut output.player);
+                });
                 ui.end_row();
                 ui.label("Resolution");
                 ui.horizontal(|ui| {
@@ -3682,11 +3687,15 @@ impl eframe::App for ProducerApp {
                             });
                             ui.end_row();
                             ui.label("Player PC IP");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut spec.player)
-                                    .hint_text("192.168.1.50"),
-                            )
-                            .on_hover_text("The PC on the LAN this projector is connected to");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut spec.player)
+                                        .desired_width(120.0)
+                                        .hint_text("192.168.1.50"),
+                                )
+                                .on_hover_text("The PC on the LAN this projector is connected to");
+                                this_pc_button(ui, &mut spec.player);
+                            });
                             ui.end_row();
                             ui.label("Overlap with previous");
                             ui.add(
@@ -4005,6 +4014,22 @@ fn overlap_is_blended(a: &ProjectorOutput, b: &ProjectorOutput, overlap: egui::R
         };
         let need = overlap.height() * 0.5;
         upper.blend.bottom >= need && lower.blend.top >= need
+    }
+}
+
+/// Sets a projector to the Player on this computer: a one-PC setup needs no
+/// network. Shows "this PC" when it already is.
+fn this_pc_button(ui: &mut egui::Ui, player: &mut String) {
+    let host = mapforge_core::player_host(&mapforge_core::normalize_player_address(player));
+    if host == "127.0.0.1" || host == "localhost" {
+        ui.label(RichText::new("this PC").small().color(LIVE))
+            .on_hover_text("The Player on this computer. No LAN needed.");
+    } else if ui
+        .small_button("This PC")
+        .on_hover_text("One PC only: use the Player on this computer, no LAN needed")
+        .clicked()
+    {
+        *player = "127.0.0.1".into();
     }
 }
 

@@ -1,14 +1,14 @@
 name: Windows installer
 
-# Builds MapForge-Setup-<version>.exe on a GitHub Windows machine.
-# Download it from the run's "Artifacts" section, or from Releases when a
-# tag such as v0.1.0 is pushed.
+# Builds MapForge-Setup-<version>.exe (full) and MapForge-Update-<version>.exe
+# (programs only) on a GitHub Windows machine. Every push to main is published
+# as release v0.1.<run number>; the apps check the latest release and offer
+# the update in a bubble.
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    tags: ["v*"]
 
 permissions:
   contents: write
@@ -27,6 +27,7 @@ jobs:
         run: choco install nsis -y --no-progress
 
       - name: Build, test and package
+        id: build
         shell: pwsh
         run: |
           $env:Path += ";${env:ProgramFiles(x86)}\NSIS"
@@ -43,10 +44,15 @@ jobs:
           name: MapForge-Update
           path: dist/MapForge-Update-*.exe
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.build.outputs.version }}
+          name: MapForge ${{ steps.build.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body: ${{ github.event.head_commit.message }}
+          make_latest: true
           files: |
             dist/MapForge-Setup-*.exe
             dist/MapForge-Update-*.exe

@@ -1627,6 +1627,7 @@ struct PlayerApp {
     setup_draft: Option<PlayerSettings>,
     /// This PC's LAN address, shown to the operator.
     ip: String,
+    updater: mapforge_core::update::Updater,
 }
 
 impl PlayerApp {
@@ -2177,6 +2178,10 @@ impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.update_textures(ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
+        if mapforge_core::update::bubble::show(ctx, &mut self.updater, None) {
+            // The installer is open and replaces the programs once we close.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         let (project, state, assigned) = {
             let mut runtime = self.shared.lock().unwrap();
@@ -2188,7 +2193,10 @@ impl eframe::App for PlayerApp {
         };
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("MapForge Player");
+            ui.heading(format!(
+                "MapForge Player {}",
+                mapforge_core::update::current_version()
+            ));
             ui.label("Producer: TCP 4777   Controller: HTTP 8080");
             if self.setup_ui(ui) {
                 return;
@@ -2457,8 +2465,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "MapForge Player",
         eframe::NativeOptions::default(),
-        Box::new(|_| {
+        Box::new(|cc| {
+            let ctx = cc.egui_ctx.clone();
+            let updater = mapforge_core::update::Updater::start(move || ctx.request_repaint());
             Ok(Box::new(PlayerApp {
+                updater,
                 shared,
                 media,
                 textures: HashMap::new(),

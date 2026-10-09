@@ -33,6 +33,11 @@ SetCompressor /SOLID lzma
 !define MUI_COMPONENTSPAGE_SMALLDESC
 !define MUI_FINISHPAGE_RUN "$INSTDIR\MapForge-Player.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Open MapForge Player now"
+; The second finish-page box opens the Producer (reusing NSIS's "show readme").
+!define MUI_FINISHPAGE_SHOWREADME
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Open MapForge Producer"
+!define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION OpenProducer
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
@@ -42,6 +47,11 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
+
+Function OpenProducer
+  IfFileExists "$INSTDIR\MapForge-Producer.exe" 0 +2
+    Exec '"$INSTDIR\MapForge-Producer.exe"'
+FunctionEnd
 
 Function .onInit
 !ifdef UPDATE_ONLY

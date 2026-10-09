@@ -9,6 +9,15 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 $version = (Select-String -Path ".\Cargo.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+# On GitHub every build gets its own number (0.1.<run>), so the apps can tell
+# that a newer release exists.
+if ($env:GITHUB_RUN_NUMBER) {
+    $parts = $version.Split('.')
+    $version = "$($parts[0]).$($parts[1]).$env:GITHUB_RUN_NUMBER"
+}
+$env:MAPFORGE_VERSION = $version
+if ($env:GITHUB_OUTPUT) { "version=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT }
+Write-Host "MapForge $version"
 
 Write-Host "Running MapForge tests..."
 cargo test --workspace

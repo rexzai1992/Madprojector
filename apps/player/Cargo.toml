@@ -10,7 +10,7 @@ eframe.workspace = true
 egui.workspace = true
 earcutr.workspace = true
 image.workspace = true
-mapforge-core = { path = "../../crates/mapforge-core" }
+mapforge-core = { path = "../../crates/mapforge-core", features = ["ui"] }
 rodio.workspace = true
 serde.workspace = true
 sha2.workspace = true

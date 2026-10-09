@@ -2218,10 +2218,12 @@ name = "mapforge-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "egui",
  "serde",
  "serde_json",
  "sha2",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

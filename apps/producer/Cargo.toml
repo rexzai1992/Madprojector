@@ -9,7 +9,7 @@ anyhow.workspace = true
 eframe.workspace = true
 egui.workspace = true
 image.workspace = true
-mapforge-core = { path = "../../crates/mapforge-core" }
+mapforge-core = { path = "../../crates/mapforge-core", features = ["ui"] }
 rfd.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

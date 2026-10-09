@@ -9,6 +9,10 @@ Run **MapForge-Setup-<version>.exe** on each PC (see the README for where to dow
 
 FFmpeg, shortcuts and the firewall rules are included. To update a PC that already has MapForge, run the much smaller **MapForge-Update-<version>.exe** (the *MapForge-Update* artifact): it replaces only the MapForge programs and closes the Player first. Windows SmartScreen may warn because the installer is not code-signed yet: choose **More info → Run anyway**.
 
+### Updates
+
+Every push to `main` is built by GitHub and published as a release `v0.1.<build number>`. When the Player or Producer is online and a newer release exists, a bubble appears in the corner: **Update now** downloads the small update installer and opens it (Windows asks for administrator permission), and the app closes so it can be replaced. **Later** hides it until the next version. The Producer asks you to save first. Offline show networks never see the bubble; update those PCs with the installer file. Set `MAPFORGE_NO_UPDATE_CHECK=1` to turn the check off.
+
 ## 2. Build it yourself (optional)
 
 Install **Rust (MSVC)** from <https://rustup.rs> (with Visual Studio Build Tools, *Desktop development with C++*) and **NSIS** from <https://nsis.sourceforge.io>. Then, in the project folder:

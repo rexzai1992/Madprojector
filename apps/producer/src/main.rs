@@ -186,6 +186,7 @@ struct ProducerApp {
     ctx: egui::Context,
     project: ShowProject,
     project_path: Option<PathBuf>,
+    updater: mapforge_core::update::Updater,
     last_saved: ShowProject,
     sync_due: Option<Instant>,
     live_sync: bool,
@@ -256,6 +257,10 @@ impl ProducerApp {
             last_saved: project.clone(),
             project,
             project_path: None,
+            updater: {
+                let ctx = cc.egui_ctx.clone();
+                mapforge_core::update::Updater::start(move || ctx.request_repaint())
+            },
             sync_due: None,
             live_sync: true,
             scene: 0,
@@ -3555,7 +3560,8 @@ impl eframe::App for ProducerApp {
         }
 
         let title = format!(
-            "MapForge Producer — {}{}",
+            "MapForge Producer {} — {}{}",
+            mapforge_core::update::current_version(),
             self.project.name,
             if self.dirty() { " •" } else { "" }
         );
@@ -3601,6 +3607,14 @@ impl eframe::App for ProducerApp {
             .default_width(300.0)
             .show(ctx, |ui| self.right_panel(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.preview_ui(ui));
+
+        let blocked = self
+            .dirty()
+            .then_some("Save your show first (Ctrl+S), then update.");
+        if mapforge_core::update::bubble::show(ctx, &mut self.updater, blocked) {
+            // The installer is open and replaces the programs once we close.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(

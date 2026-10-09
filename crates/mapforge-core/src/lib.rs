@@ -5,6 +5,7 @@ use std::{fs, io::Write, path::Path};
 use uuid::Uuid;
 
 pub mod net;
+pub mod update;
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 2;

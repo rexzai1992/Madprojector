@@ -2,9 +2,13 @@
 ;   makensis /DVERSION=0.1.0 installer\mapforge.nsi
 ; It expects dist\ to hold MapForge-Player.exe, MapForge-Producer.exe,
 ; ffmpeg.exe, ffprobe.exe and FFmpeg-LICENSE.txt.
+;
+; With /DUPDATE_ONLY it makes MapForge-Update-<version>.exe instead: only the
+; MapForge programs, without FFmpeg, for PCs that already have MapForge.
 
 Unicode true
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 
 !ifndef VERSION
   !define VERSION "0.1.0"
@@ -14,7 +18,11 @@ Unicode true
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\MapForge"
 
 Name "MapForge ${VERSION}"
-OutFile "${DIST}\MapForge-Setup-${VERSION}.exe"
+!ifdef UPDATE_ONLY
+  OutFile "${DIST}\MapForge-Update-${VERSION}.exe"
+!else
+  OutFile "${DIST}\MapForge-Setup-${VERSION}.exe"
+!endif
 InstallDir "$PROGRAMFILES64\MapForge"
 InstallDirRegKey HKLM "Software\MapForge" "InstallDir"
 RequestExecutionLevel admin
@@ -35,14 +43,35 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
+Function .onInit
+!ifdef UPDATE_ONLY
+  IfFileExists "$INSTDIR\ffmpeg.exe" +3
+    MessageBox MB_ICONSTOP "MapForge is not installed on this PC yet.$\r$\n$\r$\nRun MapForge-Setup first; this update only replaces the MapForge programs."
+    Abort
+!endif
+  ; The programs can't be replaced while they run. The Player keeps its show
+  ; on disk, so it is simply closed; the Producer may hold unsaved work.
+  nsExec::Exec 'taskkill /F /IM MapForge-Player.exe'
+  check_producer:
+  ; `find` exits with 0 when the Producer is in the task list.
+  nsExec::Exec 'cmd /c tasklist /NH | find /I "MapForge-Producer.exe"'
+  Pop $0
+  ${If} $0 == 0
+    MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION "MapForge Producer is open. Save your show and close it, then click OK." IDOK check_producer
+    Abort
+  ${EndIf}
+FunctionEnd
+
 Section "MapForge Player (every show PC)" SecPlayer
   SectionIn RO
   SetShellVarContext all
   SetOutPath "$INSTDIR"
   File "${DIST}\MapForge-Player.exe"
+!ifndef UPDATE_ONLY
   File "${DIST}\ffmpeg.exe"
   File "${DIST}\ffprobe.exe"
   File "${DIST}\FFmpeg-LICENSE.txt"
+!endif
 
   CreateDirectory "$SMPROGRAMS\MapForge"
   CreateShortcut "$SMPROGRAMS\MapForge\MapForge Player.lnk" "$INSTDIR\MapForge-Player.exe"

@@ -37,8 +37,16 @@ jobs:
           name: MapForge-Setup
           path: dist/MapForge-Setup-*.exe
 
+      # Small: only the MapForge programs, for PCs that already have MapForge.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MapForge-Update
+          path: dist/MapForge-Update-*.exe
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MapForge-Setup-*.exe
+          files: |
+            dist/MapForge-Setup-*.exe
+            dist/MapForge-Update-*.exe

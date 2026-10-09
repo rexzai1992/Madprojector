@@ -1,5 +1,5 @@
 /// A physical monitor's desktop rectangle, in native pixels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DisplayMonitor {
     pub index: u32,
     pub x: i32,
@@ -7,6 +7,8 @@ pub struct DisplayMonitor {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    /// Windows display scaling, e.g. 1.5 for 150%.
+    pub scale: f32,
 }
 
 #[cfg(windows)]
@@ -15,6 +17,7 @@ pub fn enumerate() -> Vec<DisplayMonitor> {
     use windows_sys::Win32::{
         Foundation::{BOOL, LPARAM, RECT},
         Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW},
+        UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
     };
 
     unsafe extern "system" fn collect(
@@ -51,6 +54,14 @@ pub fn enumerate() -> Vec<DisplayMonitor> {
                 height: (rect.bottom - rect.top).max(0) as u32,
                 // MONITORINFOF_PRIMARY is defined as 1 in WinUser.h.
                 primary: info.monitorInfo.dwFlags & 1 != 0,
+                scale: {
+                    let (mut dpi_x, mut dpi_y) = (96_u32, 96_u32);
+                    if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == 0 {
+                        dpi_x as f32 / 96.0
+                    } else {
+                        1.0
+                    }
+                },
             });
         }
         1

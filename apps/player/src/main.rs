@@ -2345,7 +2345,6 @@ impl eframe::App for PlayerApp {
             let aspect = output.stage_height / output.stage_width;
             let preview_width = 640.0_f32;
             let preview_height = (preview_width * aspect).clamp(120.0, 900.0);
-            let pixels_per_point = ctx.pixels_per_point();
             let mut viewport = egui::ViewportBuilder::default().with_title(match monitor {
                 Some(monitor) => format!(
                     "MapForge Output {} — {} — Display {}",
@@ -2355,18 +2354,25 @@ impl eframe::App for PlayerApp {
                 ),
                 None => format!("MapForge Preview {} — {}", index + 1, output.name),
             });
+            // An assigned output opens small in the middle of its display and
+            // then switches to real fullscreen there. Fullscreen always covers
+            // the whole display at its native pixels, whatever Windows'
+            // scaling of each screen; a window sized to the display would be
+            // resized by Windows when it lands on a screen with other scaling.
             viewport = if let Some(monitor) = monitor {
+                // New windows are placed in points of the primary display.
+                let scale = self
+                    .monitors
+                    .iter()
+                    .find(|m| m.primary)
+                    .map_or(1.0, |m| m.scale)
+                    * ctx.zoom_factor();
+                let center_x = monitor.x as f32 + monitor.width as f32 / 2.0;
+                let center_y = monitor.y as f32 + monitor.height as f32 / 2.0;
                 viewport
-                    .with_position([
-                        monitor.x as f32 / pixels_per_point,
-                        monitor.y as f32 / pixels_per_point,
-                    ])
-                    .with_inner_size([
-                        monitor.width as f32 / pixels_per_point,
-                        monitor.height as f32 / pixels_per_point,
-                    ])
+                    .with_position([center_x / scale - 160.0, center_y / scale - 90.0])
+                    .with_inner_size([320.0, 180.0])
                     .with_decorations(false)
-                    .with_resizable(false)
                     .with_always_on_top()
             } else {
                 viewport.with_inner_size([preview_width, preview_height])
@@ -2374,10 +2380,17 @@ impl eframe::App for PlayerApp {
             let textures = &self.textures;
             let project = &project;
             let state = &state;
+            let fullscreen = monitor.is_some();
+            // A new display assignment opens a new window rather than moving
+            // the old one, so it starts on the right display.
+            let placement = monitor.map(|m| (m.index, m.x, m.y, m.width, m.height));
             ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(("output", output.id)),
+                egui::ViewportId::from_hash_of(("output", output.id, placement)),
                 viewport,
                 move |ctx, _| {
+                    if fullscreen && ctx.input(|i| i.viewport().fullscreen) != Some(true) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    }
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
                         .show(ctx, |ui| {

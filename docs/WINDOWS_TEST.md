@@ -7,7 +7,7 @@ Run **MapForge-Setup-<version>.exe** on each PC (see the README for where to dow
 - **MapForge Player** on every show PC, plus **Open the Player when Windows starts**.
 - **MapForge Producer** on the design PC.
 
-FFmpeg, shortcuts and the firewall rules are included. Windows SmartScreen may warn because the installer is not code-signed yet: choose **More info → Run anyway**.
+FFmpeg, shortcuts and the firewall rules are included. To update a PC that already has MapForge, run the much smaller **MapForge-Update-<version>.exe** (the *MapForge-Update* artifact): it replaces only the MapForge programs and closes the Player first. Windows SmartScreen may warn because the installer is not code-signed yet: choose **More info → Run anyway**.
 
 ## 2. Build it yourself (optional)
 
@@ -69,6 +69,8 @@ Record Windows version, CPU, RAM, GPU, VRAM, storage, display connections, and p
 7. To start on boot, put a shortcut to `mapforge-player.exe` in `shell:startup` on each PC and set Windows to sign in automatically.
 
 ## Physical display assignment
+
+No NVIDIA Surround, AMD Eyefinity or Windows duplication: every projector stays a separate Windows display. Set each projector's Windows scaling to 100% where possible. An assigned output opens on its display and switches to real borderless fullscreen there, so it covers the whole display at native resolution even when displays use different scaling.
 
 1. Open Windows **Display Settings**, choose **Extend these displays**, and note the numbered display attached to each projector.
 2. In Producer, open **Edit projectors**, select a projector, and set **Player display** to the matching display number. Leave it on **Preview window** until the number is confirmed.

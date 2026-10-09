@@ -44,7 +44,9 @@ if ($makensis) {
     Write-Host "Making the installer..."
     & $makensis "/DVERSION=$version" ".\installer\mapforge.nsi"
     if ($LASTEXITCODE -ne 0) { throw "Installer build failed." }
-    Write-Host "Done: dist\MapForge-Setup-$version.exe"
+    & $makensis "/DVERSION=$version" "/DUPDATE_ONLY" ".\installer\mapforge.nsi"
+    if ($LASTEXITCODE -ne 0) { throw "Update installer build failed." }
+    Write-Host "Done: dist\MapForge-Setup-$version.exe (full) and dist\MapForge-Update-$version.exe (programs only)"
 } else {
     Write-Host "Build complete in dist\. Install NSIS to also make the one-file installer."
 }

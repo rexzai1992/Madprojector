@@ -2323,10 +2323,15 @@ impl eframe::App for PlayerApp {
         let mut reset_choice = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!(
-                "MapForge Player {}",
-                mapforge_core::update::current_version()
-            ));
+            ui.horizontal(|ui| {
+                ui.heading(format!(
+                    "MapForge Player {}",
+                    mapforge_core::update::current_version()
+                ));
+                if ui.small_button("Check for updates").clicked() {
+                    self.updater.check_now();
+                }
+            });
             ui.label("Producer: TCP 4777   Controller: HTTP 8080");
             if self.setup_ui(ui) {
                 return;

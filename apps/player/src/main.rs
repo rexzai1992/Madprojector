@@ -9,9 +9,9 @@ use displays::DisplayMonitor;
 use eframe::egui;
 use mapforge_core::{
     net::unix_time_ms, player_host, scene_hotkey, tool_command, Asset, AssetKind, AssetStatus,
-    Command, EndAction, Envelope, Layer, LoopRegion, PlayerRole, PlayerState, ProjectorOutput,
-    Scene, ShowProject, TestPattern, Transport, CONTROLLER_PORT, DEFAULT_PLAYER_PORT,
-    PROTOCOL_VERSION,
+    Command, DisplayInfo, EndAction, Envelope, Layer, LoopRegion, PlayerRole, PlayerState,
+    ProjectorOutput, Scene, ShowProject, TestPattern, Transport, CONTROLLER_PORT,
+    DEFAULT_PLAYER_PORT, PROTOCOL_VERSION,
 };
 use relay::Relay;
 use serde::Deserialize;
@@ -1623,6 +1623,8 @@ struct PlayerApp {
     textures: HashMap<Uuid, (egui::TextureHandle, u64)>,
     show_outputs: bool,
     monitors: Vec<DisplayMonitor>,
+    /// When the screens were last listed; projectors plugged in later appear.
+    monitors_checked: Option<Instant>,
     /// The master-or-sub form, open on first start or when changing it.
     setup_draft: Option<PlayerSettings>,
     /// This PC's LAN address, shown to the operator.
@@ -1631,6 +1633,35 @@ struct PlayerApp {
 }
 
 impl PlayerApp {
+    /// Lists the screens again and tells Producer about them.
+    fn refresh_monitors(&mut self) {
+        self.monitors = displays::enumerate();
+        self.monitors_checked = Some(Instant::now());
+        self.shared.lock().unwrap().state.displays = self
+            .monitors
+            .iter()
+            .map(|m| DisplayInfo {
+                index: m.index,
+                width: m.width,
+                height: m.height,
+                primary: m.primary,
+            })
+            .collect();
+    }
+
+    /// Remembers the screen chosen on this PC for a projector: `Some` to
+    /// choose (a display, or `None` for a window), `None` to forget it.
+    fn choose_display(&mut self, output: Uuid, choice: Option<Option<u32>>) {
+        let mut runtime = self.shared.lock().unwrap();
+        match choice {
+            Some(choice) => runtime.settings.displays.insert(output, choice),
+            None => runtime.settings.displays.remove(&output),
+        };
+        if let Err(e) = setup::save_settings(&runtime.settings) {
+            runtime.state.message = format!("Could not save the screen choice: {e}");
+        }
+    }
+
     /// First-start question: is this PC the master or a sub? Returns whether
     /// the form is showing.
     fn setup_ui(&mut self, ui: &mut egui::Ui) -> bool {
@@ -1692,10 +1723,12 @@ impl PlayerApp {
         if save {
             let mut settings = self.setup_draft.take().unwrap();
             settings.master = settings.master.trim().to_owned();
-            if let Err(e) = setup::save_settings(&settings) {
-                self.shared.lock().unwrap().state.message = format!("Could not save setup: {e}");
-            }
             let mut runtime = self.shared.lock().unwrap();
+            // Screens chosen meanwhile are kept.
+            settings.displays = runtime.settings.displays.clone();
+            if let Err(e) = setup::save_settings(&settings) {
+                runtime.state.message = format!("Could not save setup: {e}");
+            }
             runtime.settings = settings;
             runtime.link_note.clear();
         } else if cancel {
@@ -2183,14 +2216,22 @@ impl eframe::App for PlayerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        let (project, state, assigned) = {
+        if self
+            .monitors_checked
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
+        {
+            self.refresh_monitors();
+        }
+        let (project, state, assigned, chosen) = {
             let mut runtime = self.shared.lock().unwrap();
             (
                 runtime.project.clone(),
                 runtime.snapshot(),
                 runtime.outputs.clone(),
+                runtime.settings.displays.clone(),
             )
         };
+        let mut reset_choice = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(format!(
@@ -2308,14 +2349,59 @@ impl eframe::App for PlayerApp {
                     .map(|o| o.name.as_str())
                     .collect();
                 ui.label(format!("Projectors on this PC: {}", mine.join(", ")));
+                // Where each projector's picture is, and why when it's a window.
+                for output in project
+                    .outputs
+                    .iter()
+                    .filter(|o| assigned.as_ref().is_none_or(|ids| ids.contains(&o.id)))
+                {
+                    let local = chosen.get(&output.id).copied();
+                    let wanted = local.unwrap_or(output.display_index);
+                    let found = wanted.and_then(|d| self.monitors.iter().find(|m| m.index == d));
+                    let (text, color) = match (wanted, found) {
+                        (Some(_), Some(m)) => (
+                            format!(
+                                "{}: fullscreen on Display {} ({}×{})",
+                                output.name,
+                                m.index + 1,
+                                m.width,
+                                m.height
+                            ),
+                            egui::Color32::from_rgb(31, 157, 98),
+                        ),
+                        (Some(d), None) => (
+                            format!(
+                                "{}: Display {} is not connected, so it shows as a window",
+                                output.name,
+                                d + 1
+                            ),
+                            egui::Color32::YELLOW,
+                        ),
+                        (None, _) => (
+                            format!(
+                                "{}: window. Drag it onto its projector and double-click it.",
+                                output.name
+                            ),
+                            egui::Color32::GRAY,
+                        ),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, text);
+                        if local.is_some()
+                            && ui
+                                .small_button("Use Producer's setting")
+                                .on_hover_text("Forget the screen chosen on this PC")
+                                .clicked()
+                        {
+                            reset_choice = Some(output.id);
+                        }
+                    });
+                }
             }
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!(
-                    "Physical displays detected: {}",
-                    self.monitors.len()
-                ));
-                if ui.small_button("Refresh displays").clicked() {
-                    self.monitors = displays::enumerate();
+                ui.label(format!("Screens on this PC: {}", self.monitors.len()));
+                if ui.small_button("Refresh").clicked() {
+                    self.refresh_monitors();
                 }
             });
             for monitor in &self.monitors {
@@ -2326,7 +2412,11 @@ impl eframe::App for PlayerApp {
                     monitor.height,
                     monitor.x,
                     monitor.y,
-                    if monitor.primary { " (primary)" } else { "" }
+                    if monitor.primary {
+                        " (main screen)"
+                    } else {
+                        ""
+                    }
                 ));
             }
             ui.label(format!("Media cache: {}", media_cache_dir().display()));
@@ -2334,12 +2424,16 @@ impl eframe::App for PlayerApp {
             ui.label("Closing Producer or the controller does not stop this Player.");
         });
 
+        if let Some(id) = reset_choice {
+            self.choose_display(id, None);
+        }
         if !self.show_outputs {
             return;
         }
         let Some(project) = project else {
             return;
         };
+        let mut clicked = Vec::new();
         for (index, output) in project.outputs.iter().enumerate() {
             if assigned
                 .as_ref()
@@ -2347,9 +2441,12 @@ impl eframe::App for PlayerApp {
             {
                 continue;
             }
-            let monitor = output
-                .display_index
-                .and_then(|display| self.monitors.iter().find(|m| m.index == display));
+            let wanted = chosen
+                .get(&output.id)
+                .copied()
+                .unwrap_or(output.display_index);
+            let monitor =
+                wanted.and_then(|display| self.monitors.iter().find(|m| m.index == display));
             let aspect = output.stage_height / output.stage_width;
             let preview_width = 640.0_f32;
             let preview_height = (preview_width * aspect).clamp(120.0, 900.0);
@@ -2392,20 +2489,57 @@ impl eframe::App for PlayerApp {
             // A new display assignment opens a new window rather than moving
             // the old one, so it starts on the right display.
             let placement = monitor.map(|m| (m.index, m.x, m.y, m.width, m.height));
-            ctx.show_viewport_immediate(
+            let clicked_here = ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of(("output", output.id, placement)),
                 viewport,
                 move |ctx, _| {
                     if fullscreen && ctx.input(|i| i.viewport().fullscreen) != Some(true) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                     }
+                    // Double-click: fill the screen this window is on, or go
+                    // back to a window. The window's centre, in desktop
+                    // pixels, says which screen it is on.
+                    let double = ctx.input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                            || (fullscreen && i.key_pressed(egui::Key::Escape))
+                    });
+                    let click = double.then(|| {
+                        if fullscreen {
+                            None
+                        } else {
+                            let ppp = ctx.pixels_per_point();
+                            ctx.input(|i| i.viewport().outer_rect)
+                                .map(|r| (r.center().x * ppp, r.center().y * ppp))
+                        }
+                    });
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
                         .show(ctx, |ui| {
                             paint_output(ui, index, project, state, output, textures)
                         });
+                    click
                 },
             );
+            if let Some(click) = clicked_here {
+                clicked.push((output.id, click));
+            }
+        }
+        for (id, click) in clicked {
+            match click {
+                None => self.choose_display(id, Some(None)),
+                Some((x, y)) => {
+                    let screen = self.monitors.iter().find(|m| {
+                        x >= m.x as f32
+                            && y >= m.y as f32
+                            && x < (m.x + m.width as i32) as f32
+                            && y < (m.y + m.height as i32) as f32
+                    });
+                    if let Some(screen) = screen {
+                        self.choose_display(id, Some(Some(screen.index)));
+                    }
+                }
+            }
         }
     }
 }
@@ -2475,6 +2609,7 @@ fn main() -> eframe::Result<()> {
                 textures: HashMap::new(),
                 show_outputs: true,
                 monitors: displays::enumerate(),
+                monitors_checked: None,
                 setup_draft,
                 ip: setup::local_ip().unwrap_or_else(|| "unknown".into()),
             }))

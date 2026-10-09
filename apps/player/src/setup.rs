@@ -7,6 +7,7 @@ use mapforge_core::{net::connect, Asset, Command, PlayerRole, ShowProject, CONTR
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpStream, UdpSocket},
@@ -15,6 +16,7 @@ use std::{
     thread,
     time::Duration,
 };
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -25,6 +27,10 @@ pub struct PlayerSettings {
     pub master: String,
     /// Master only: start the first scene as soon as the Player opens.
     pub autoplay: bool,
+    /// Screens chosen on this PC by double-clicking a projector window:
+    /// projector → display, or `None` to keep it a window. These win over the
+    /// display set in Producer.
+    pub displays: HashMap<Uuid, Option<u32>>,
 }
 
 impl PlayerSettings {

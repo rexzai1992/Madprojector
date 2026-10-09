@@ -831,7 +831,33 @@ pub struct PlayerState {
     /// The master starts the first scene by itself when it opens.
     #[serde(default)]
     pub autoplay: bool,
+    /// Screens connected to this Player PC, for choosing projector displays.
+    #[serde(default)]
+    pub displays: Vec<DisplayInfo>,
     pub message: String,
+}
+
+/// One screen on a Player PC. `index` is what a projector's `display_index`
+/// refers to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DisplayInfo {
+    pub index: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The Windows main display, usually the control monitor.
+    pub primary: bool,
+}
+
+impl DisplayInfo {
+    pub fn label(&self) -> String {
+        format!(
+            "Display {} — {}×{}{}",
+            self.index + 1,
+            self.width,
+            self.height,
+            if self.primary { " (main screen)" } else { "" }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -857,6 +883,7 @@ impl Default for PlayerState {
             followers: Vec::new(),
             role: None,
             autoplay: false,
+            displays: Vec::new(),
             message: "Waiting for Producer".into(),
         }
     }

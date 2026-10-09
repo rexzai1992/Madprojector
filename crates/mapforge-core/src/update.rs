@@ -13,7 +13,7 @@ use std::{
 pub const RELEASES_API: &str =
     "https://api.github.com/repos/rexzai1992/Madprojector/releases/latest";
 const FIRST_CHECK: Duration = Duration::from_secs(5);
-const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
 
 /// This build's version: set by the release build, otherwise Cargo's.
 pub fn current_version() -> &'static str {
@@ -36,7 +36,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     pub version: String,
-    /// First lines of the release notes.
+    /// The release's one-line summary.
     pub notes: String,
     /// The small installer that replaces only the MapForge programs.
     pub installer_url: String,
@@ -66,10 +66,9 @@ fn parse_release(json: &str) -> Result<Release, String> {
         .body
         .unwrap_or_default()
         .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with("Co-Authored-By"))
-        .take(3)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default()
+        .to_string();
     Ok(Release {
         version: latest.tag_name.trim_start_matches('v').to_string(),
         notes,
@@ -107,6 +106,10 @@ fn fetch_latest() -> Result<Release, String> {
 pub enum UpdateState {
     /// Up to date, not checked yet, or offline.
     Idle,
+    /// "Check for updates" was pressed and the answer hasn't come yet.
+    Checking,
+    /// The answer to "Check for updates" when nothing newer exists.
+    UpToDate,
     Available(Release),
     Downloading(Release),
     /// The installer is open; the app should close so it can be replaced.
@@ -170,9 +173,39 @@ impl Updater {
         let state = self.state.lock().unwrap().clone();
         match state {
             UpdateState::Available(release) => self.dismissed = Some(release.version),
-            UpdateState::Failed(_) => *self.state.lock().unwrap() = UpdateState::Idle,
+            UpdateState::Failed(_) | UpdateState::UpToDate => {
+                *self.state.lock().unwrap() = UpdateState::Idle
+            }
             _ => {}
         }
+    }
+
+    /// Asks GitHub now and always answers, even when up to date.
+    pub fn check_now(&mut self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            if matches!(
+                *state,
+                UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Installing
+            ) {
+                return;
+            }
+            *state = UpdateState::Checking;
+        }
+        self.dismissed = None;
+        let state = self.state.clone();
+        let repaint = self.repaint.clone();
+        thread::spawn(move || {
+            let answer = match fetch_latest() {
+                Ok(release) if is_newer(&release.version, current_version()) => {
+                    UpdateState::Available(release)
+                }
+                Ok(_) => UpdateState::UpToDate,
+                Err(error) => UpdateState::Failed(format!("Can't reach GitHub: {error}")),
+            };
+            *state.lock().unwrap() = answer;
+            repaint();
+        });
     }
 
     /// Downloads the update installer and opens it.
@@ -290,6 +323,20 @@ pub mod bubble {
                                     ui.spinner();
                                     ui.label(format!("Downloading MapForge {}…", release.version));
                                 });
+                            }
+                            UpdateState::Checking => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Checking for updates…");
+                                });
+                            }
+                            UpdateState::UpToDate => {
+                                ui.label(RichText::new("✔ Up to date").strong());
+                                ui.label(format!(
+                                    "MapForge {} is the newest version.",
+                                    current_version()
+                                ));
+                                later = ui.button("Close").clicked();
                             }
                             UpdateState::Failed(error) => {
                                 ui.label(RichText::new("Update failed").strong());

@@ -1442,6 +1442,17 @@ impl ProducerApp {
                     self.save(true);
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui
+                    .button(format!(
+                        "Check for updates (this is {})",
+                        mapforge_core::update::current_version()
+                    ))
+                    .clicked()
+                {
+                    self.updater.check_now();
+                    ui.close_menu();
+                }
             });
             let can_undo = self.history.can_undo(&self.project);
             let can_redo = self.history.can_redo();

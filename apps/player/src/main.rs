@@ -1632,7 +1632,96 @@ struct PlayerApp {
     updater: mapforge_core::update::Updater,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ScreenSource {
+    /// Double-clicked on this PC.
+    ThisPc,
+    /// Set in Producer's Edit projectors.
+    Producer,
+    /// The next free extra screen.
+    Automatic,
+}
+
+struct Placement {
+    /// The screen to fill; `None` keeps a window.
+    display: Option<u32>,
+    source: ScreenSource,
+    /// A chosen screen that isn't connected, replaced automatically.
+    missing: Option<u32>,
+}
+
+/// See [`PlayerApp::screen_plan`].
+fn plan_screens(
+    monitors: &[DisplayMonitor],
+    project: &ShowProject,
+    assigned: &Option<Vec<Uuid>>,
+    chosen: &HashMap<Uuid, Option<u32>>,
+) -> HashMap<Uuid, Placement> {
+    let connected = |d: u32| monitors.iter().any(|m| m.index == d);
+    let mine: Vec<&ProjectorOutput> = project
+        .outputs
+        .iter()
+        .filter(|o| assigned.as_ref().is_none_or(|ids| ids.contains(&o.id)))
+        .collect();
+    let mut plan = HashMap::new();
+    let mut taken = HashSet::new();
+    let mut missing = HashMap::new();
+    for output in &mine {
+        let explicit = match chosen.get(&output.id) {
+            Some(choice) => Some((*choice, ScreenSource::ThisPc)),
+            None => output
+                .display_index
+                .map(|d| (Some(d), ScreenSource::Producer)),
+        };
+        match explicit {
+            Some((Some(d), _)) if !connected(d) => {
+                missing.insert(output.id, d);
+            }
+            Some((display, source)) => {
+                taken.extend(display);
+                plan.insert(
+                    output.id,
+                    Placement {
+                        display,
+                        source,
+                        missing: None,
+                    },
+                );
+            }
+            None => {}
+        }
+    }
+    let mut free: Vec<&DisplayMonitor> = monitors
+        .iter()
+        .filter(|m| !m.primary && !taken.contains(&m.index))
+        .collect();
+    free.sort_by_key(|m| (m.x, m.y));
+    let mut free = free.into_iter();
+    for output in mine {
+        plan.entry(output.id).or_insert_with(|| Placement {
+            display: free.next().map(|m| m.index),
+            source: ScreenSource::Automatic,
+            missing: missing.get(&output.id).copied(),
+        });
+    }
+    plan
+}
+
 impl PlayerApp {
+    /// Which screen each of this PC's projectors fills: the one chosen on this
+    /// PC, else the one set in Producer, else the next free extra screen from
+    /// left to right. The main screen is never filled automatically, so the
+    /// control windows stay visible. A chosen screen that isn't connected is
+    /// replaced automatically.
+    fn screen_plan(
+        &self,
+        project: &ShowProject,
+        assigned: &Option<Vec<Uuid>>,
+        chosen: &HashMap<Uuid, Option<u32>>,
+    ) -> HashMap<Uuid, Placement> {
+        plan_screens(&self.monitors, project, assigned, chosen)
+    }
+
     /// Lists the screens again and tells Producer about them.
     fn refresh_monitors(&mut self) {
         self.monitors = displays::enumerate();
@@ -2350,46 +2439,58 @@ impl eframe::App for PlayerApp {
                     .collect();
                 ui.label(format!("Projectors on this PC: {}", mine.join(", ")));
                 // Where each projector's picture is, and why when it's a window.
+                let plan = self.screen_plan(project, &assigned, &chosen);
                 for output in project
                     .outputs
                     .iter()
                     .filter(|o| assigned.as_ref().is_none_or(|ids| ids.contains(&o.id)))
                 {
-                    let local = chosen.get(&output.id).copied();
-                    let wanted = local.unwrap_or(output.display_index);
-                    let found = wanted.and_then(|d| self.monitors.iter().find(|m| m.index == d));
-                    let (text, color) = match (wanted, found) {
-                        (Some(_), Some(m)) => (
-                            format!(
-                                "{}: fullscreen on Display {} ({}×{})",
-                                output.name,
-                                m.index + 1,
-                                m.width,
-                                m.height
-                            ),
-                            egui::Color32::from_rgb(31, 157, 98),
+                    let Some(placed) = plan.get(&output.id) else {
+                        continue;
+                    };
+                    let screen = placed
+                        .display
+                        .and_then(|d| self.monitors.iter().find(|m| m.index == d));
+                    let mut text = match (screen, placed.source) {
+                        (Some(m), source) => format!(
+                            "{}: fullscreen on Display {} ({}×{}){}",
+                            output.name,
+                            m.index + 1,
+                            m.width,
+                            m.height,
+                            match source {
+                                ScreenSource::ThisPc => ", chosen on this PC",
+                                ScreenSource::Producer => "",
+                                ScreenSource::Automatic => ", automatic",
+                            }
                         ),
-                        (Some(d), None) => (
-                            format!(
-                                "{}: Display {} is not connected, so it shows as a window",
-                                output.name,
-                                d + 1
-                            ),
-                            egui::Color32::YELLOW,
+                        (None, ScreenSource::ThisPc) => {
+                            format!("{}: window, chosen on this PC", output.name)
+                        }
+                        (None, _) if self.monitors.len() <= 1 => format!(
+                            "{}: window. Only the main screen is connected; plug in the \
+                             projector as an extended display.",
+                            output.name
                         ),
-                        (None, _) => (
-                            format!(
-                                "{}: window. Drag it onto its projector and double-click it.",
-                                output.name
-                            ),
-                            egui::Color32::GRAY,
+                        (None, _) => format!(
+                            "{}: window. No free screen; drag it onto a screen and \
+                             double-click it to fill that screen.",
+                            output.name
                         ),
+                    };
+                    if let Some(missing) = placed.missing {
+                        text += &format!(" (Display {} is not connected)", missing + 1);
+                    }
+                    let color = if screen.is_some() {
+                        egui::Color32::from_rgb(31, 157, 98)
+                    } else {
+                        egui::Color32::YELLOW
                     };
                     ui.horizontal(|ui| {
                         ui.colored_label(color, text);
-                        if local.is_some()
+                        if placed.source == ScreenSource::ThisPc
                             && ui
-                                .small_button("Use Producer's setting")
+                                .small_button("Automatic")
                                 .on_hover_text("Forget the screen chosen on this PC")
                                 .clicked()
                         {
@@ -2434,6 +2535,7 @@ impl eframe::App for PlayerApp {
             return;
         };
         let mut clicked = Vec::new();
+        let plan = self.screen_plan(&project, &assigned, &chosen);
         for (index, output) in project.outputs.iter().enumerate() {
             if assigned
                 .as_ref()
@@ -2441,12 +2543,10 @@ impl eframe::App for PlayerApp {
             {
                 continue;
             }
-            let wanted = chosen
+            let monitor = plan
                 .get(&output.id)
-                .copied()
-                .unwrap_or(output.display_index);
-            let monitor =
-                wanted.and_then(|display| self.monitors.iter().find(|m| m.index == display));
+                .and_then(|placed| placed.display)
+                .and_then(|display| self.monitors.iter().find(|m| m.index == display));
             let aspect = output.stage_height / output.stage_width;
             let preview_width = 640.0_f32;
             let preview_height = (preview_width * aspect).clamp(120.0, 900.0);
@@ -2669,5 +2769,71 @@ mod output_mapping_tests {
             .start_error_ms
             .is_some_and(|error| error >= 20.0));
         assert!(runtime.scheduled.is_none());
+    }
+}
+
+#[cfg(test)]
+mod screen_plan_tests {
+    use super::*;
+
+    fn screen(index: u32, x: i32, primary: bool) -> DisplayMonitor {
+        DisplayMonitor {
+            index,
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn projectors_fill_extra_screens_left_to_right() {
+        let project = ShowProject::default(); // two projectors
+        let [a, b] = [project.outputs[0].id, project.outputs[1].id];
+        // Windows numbers don't follow the desk order: 3 is left of 2.
+        let monitors = [
+            screen(0, 0, true),
+            screen(2, 3840, false),
+            screen(1, 1920, false),
+        ];
+        let plan = plan_screens(&monitors, &project, &None, &HashMap::new());
+        assert_eq!(plan[&a].display, Some(1));
+        assert_eq!(plan[&b].display, Some(2));
+        assert!(plan[&a].source == ScreenSource::Automatic);
+
+        // Only the main screen: both stay windows.
+        let plan = plan_screens(&monitors[..1], &project, &None, &HashMap::new());
+        assert_eq!(plan[&a].display, None);
+    }
+
+    #[test]
+    fn chosen_screens_win_and_missing_ones_fall_back() {
+        let mut project = ShowProject::default();
+        let [a, b] = [project.outputs[0].id, project.outputs[1].id];
+        let monitors = [
+            screen(0, 0, true),
+            screen(1, 1920, false),
+            screen(2, 3840, false),
+        ];
+        // Producer put projector 1 on Display 3; projector 2 gets the free one.
+        project.outputs[0].display_index = Some(2);
+        let plan = plan_screens(&monitors, &project, &None, &HashMap::new());
+        assert_eq!(plan[&a].display, Some(2));
+        assert_eq!(plan[&b].display, Some(1));
+
+        // A choice on this PC wins; a screen that isn't there is replaced.
+        let chosen = HashMap::from([(a, Some(1)), (b, Some(7))]);
+        let plan = plan_screens(&monitors, &project, &None, &chosen);
+        assert_eq!(plan[&a].display, Some(1));
+        assert!(plan[&a].source == ScreenSource::ThisPc);
+        assert_eq!(plan[&b].display, Some(2));
+        assert_eq!(plan[&b].missing, Some(7));
+
+        // "Window" chosen on this PC stays a window.
+        let chosen = HashMap::from([(a, None)]);
+        let plan = plan_screens(&monitors, &project, &None, &chosen);
+        assert_eq!(plan[&a].display, None);
     }
 }

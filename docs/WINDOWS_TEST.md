@@ -74,7 +74,7 @@ Record Windows version, CPU, RAM, GPU, VRAM, storage, display connections, and p
 
 ## Physical display assignment
 
-**Quickest way:** on the Player PC, drag each projector's preview window onto its projector and **double-click** it. It fills that screen, and the Player remembers it (in `player-settings.json`). Double-click again, or press **Esc**, to get the window back. The Player window lists every projector: which screen it fills, or why it is a window ("not connected", or not chosen yet). **Use Producer's setting** forgets a choice made on the PC.
+**Automatic:** projectors with no screen chosen fill the extra screens (not the main screen) by themselves, left to right, as soon as they are connected. To change one, on the Player PC drag each projector's preview window onto its projector and **double-click** it. It fills that screen, and the Player remembers it (in `player-settings.json`). Double-click again, or press **Esc**, to get the window back. The Player window lists every projector: which screen it fills, or why it is a window ("not connected", or not chosen yet). **Use Producer's setting** forgets a choice made on the PC.
 
 **From Producer:** **Player display** lists the screens the Player PC reports, e.g. "Display 2 — 1920×1080". Windows' internal display numbers can differ from the numbers in Settings → Identify, so pick by resolution and check with **Identify projectors**.
 

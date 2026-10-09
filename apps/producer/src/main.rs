@@ -2713,7 +2713,7 @@ impl ProducerApp {
                 egui::ComboBox::from_id_salt("player_display")
                     .width(220.0)
                     .selected_text(match output.display_index {
-                        None => "Preview window".to_owned(),
+                        None => "Automatic (next free screen)".to_owned(),
                         Some(display) => detected.iter().find(|d| d.index == display).map_or_else(
                             || {
                                 if detected.is_empty() {
@@ -2726,7 +2726,14 @@ impl ProducerApp {
                         ),
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut output.display_index, None, "Preview window");
+                        ui.selectable_value(
+                            &mut output.display_index,
+                            None,
+                            "Automatic (next free screen)",
+                        )
+                        .on_hover_text(
+                            "Fills the next extra screen, left to right; never the main screen",
+                        );
                         if detected.is_empty() {
                             // Player offline or older: offer plain numbers.
                             for display in 0..16_u32 {

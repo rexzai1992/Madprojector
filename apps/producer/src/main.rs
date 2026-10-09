@@ -8,8 +8,8 @@ mod timeline;
 use eframe::egui::{self, Color32, RichText};
 use mapforge_core::{
     load_project, save_project_atomic, scene_hotkey, sha256_file, tool_command, Asset, AssetKind,
-    Command, Cue, EdgeBlend, EndAction, Layer, LoopRegion, OutputColor, PlayerRole, PlayerState,
-    ProjectorOutput, Scene, SceneButton, ShowProject, TestPattern, Transport,
+    Command, Cue, DisplayInfo, EdgeBlend, EndAction, Layer, LoopRegion, OutputColor, PlayerRole,
+    PlayerState, ProjectorOutput, Scene, SceneButton, ShowProject, TestPattern, Transport,
 };
 use network::{unix_time_ms, PlayerLink};
 use std::{
@@ -2650,6 +2650,17 @@ impl ProducerApp {
             return;
         };
         let color = OUTPUT_COLORS[index % OUTPUT_COLORS.len()];
+        // Screens the projector's Player PC reports, to pick from by name.
+        let address = self.project.outputs[index].player_address();
+        let detected: Vec<DisplayInfo> = self
+            .links
+            .iter()
+            .find(|l| l.address == address)
+            .and_then(|l| {
+                let status = l.status.lock().unwrap();
+                status.state.as_ref().map(|s| s.displays.clone())
+            })
+            .unwrap_or_default();
         let output = &mut self.project.outputs[index];
         section(ui, &format!("Projector {}", index + 1));
         let mut geometry_changed = false;
@@ -2700,17 +2711,37 @@ impl ProducerApp {
                 ui.end_row();
                 ui.label("Player display");
                 egui::ComboBox::from_id_salt("player_display")
-                    .selected_text(output.display_index.map_or_else(
-                        || "Preview window".to_owned(),
-                        |display| format!("Display {} fullscreen", display + 1),
-                    ))
+                    .width(220.0)
+                    .selected_text(match output.display_index {
+                        None => "Preview window".to_owned(),
+                        Some(display) => detected.iter().find(|d| d.index == display).map_or_else(
+                            || {
+                                if detected.is_empty() {
+                                    format!("Display {}", display + 1)
+                                } else {
+                                    format!("Display {} (not connected)", display + 1)
+                                }
+                            },
+                            DisplayInfo::label,
+                        ),
+                    })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut output.display_index, None, "Preview window");
-                        for display in 0..16_u32 {
+                        if detected.is_empty() {
+                            // Player offline or older: offer plain numbers.
+                            for display in 0..16_u32 {
+                                ui.selectable_value(
+                                    &mut output.display_index,
+                                    Some(display),
+                                    format!("Display {}", display + 1),
+                                );
+                            }
+                        }
+                        for display in &detected {
                             ui.selectable_value(
                                 &mut output.display_index,
-                                Some(display),
-                                format!("Display {} fullscreen", display + 1),
+                                Some(display.index),
+                                display.label(),
                             );
                         }
                     });
@@ -2718,8 +2749,9 @@ impl ProducerApp {
             });
         ui.label(
             RichText::new(
-                "Display numbers follow the Windows Display Settings order on that Player PC. \
-                 Use Identify after assigning them.",
+                "The list shows the screens connected to that Player PC. Or, on the Player PC, \
+                 drag a preview window onto its projector and double-click it. Use Identify to \
+                 check.",
             )
             .small()
             .color(MUTED),

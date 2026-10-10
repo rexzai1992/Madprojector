@@ -1,158 +1,443 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#090d16">
+<meta name="theme-color" content="#080b12">
 <title>MapForge Control</title>
 <style>
-:root { --accent: #246bfe; --columns: 2; }
+:root {
+  color-scheme: dark;
+  --accent: #4c8dff;
+  --bg: #080b12;
+  --panel: #111722;
+  --panel-raised: #171f2d;
+  --line: #273244;
+  --muted: #94a1b6;
+  --text: #eff4ff;
+  --green: #36d399;
+  --red: #ff596d;
+  --amber: #ffbd4a;
+  --columns: 2;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
 * { box-sizing: border-box; }
-body { font-family: system-ui, sans-serif; background: #090d16; color: #edf2ff; margin: 0 auto; padding: 20px 16px 40px; max-width: 900px; -webkit-user-select: none; user-select: none; }
-h1 { font-size: 24px; margin: 0 0 4px; }
-#note { color: #9ca8bf; margin: 0 0 12px; white-space: pre-wrap; }
-#status { padding: 14px; background: #151c2d; border-radius: 12px; margin: 12px 0 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.dot { width: 12px; height: 12px; border-radius: 50%; background: #d43d51; flex: none; }
-.dot.playing { background: #1f9d62; } .dot.paused { background: #f0aa28; } .dot.ready { background: var(--accent); } .dot.stopped { background: #6b7280; }
-.grid { display: grid; grid-template-columns: repeat(var(--columns), 1fr); gap: 12px; }
-h2 { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: #9ca8bf; margin: 24px 0 10px; }
-button { font: inherit; font-weight: 700; padding: 20px 14px; border: 0; border-radius: 12px; background: var(--accent); color: white; min-height: 64px; touch-action: manipulation; }
-button:active { filter: brightness(1.25); transform: scale(.98); }
-button.dark { background: #282f40; } button.stop { background: #d43d51; } button.on { outline: 3px solid white; }
-.scene { background: #1c2436; text-align: left; display: flex; gap: 10px; align-items: center; }
-.scene.live { outline: 3px solid #1f9d62; }
-.scene b { font-size: 12px; opacity: .7; min-width: 28px; }
-.scene-group { display: contents; }
-.cue { background: #151c2d; border: 1px solid #2a3550; font-weight: 600; min-height: 52px; padding: 12px; text-align: left; }
-.cue::before { content: "◆ "; color: #f0aa28; }
-.cue b { font-size: 11px; opacity: .7; margin-right: 6px; }
-.loop::before { content: "⟲ "; color: #4fd1c5; }
-.loop.live { outline: 3px solid #4fd1c5; }
-.cue small { color: #9ca8bf; font-weight: 500; }
-#exit-loop { width: 100%; margin: 0 0 16px; background: #0f766e; font-size: 18px; }
-input[type=range] { width: 100%; height: 36px; accent-color: var(--accent); }
-.hidden { display: none; }
-small { color: #9ca8bf; display: block; margin-top: 28px; }
+body {
+  min-height: 100vh;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: max(20px, env(safe-area-inset-top)) 20px max(32px, env(safe-area-inset-bottom));
+  background: radial-gradient(ellipse at 50% -28%, #172440 0, transparent 58%), var(--bg);
+  -webkit-user-select: none;
+  user-select: none;
+}
+button, input { font: inherit; }
+button {
+  min-height: 54px;
+  padding: 13px 16px;
+  color: var(--text);
+  font-weight: 700;
+  border: 1px solid transparent;
+  border-radius: 13px;
+  background: var(--panel-raised);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform .12s ease, filter .12s ease, border-color .12s ease, background .12s ease;
+}
+button:hover:not(:disabled) { filter: brightness(1.14); border-color: #52617a; }
+button:active:not(:disabled) { transform: scale(.98); }
+button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+button:disabled { opacity: .38; cursor: not-allowed; }
+.shell { display: grid; gap: 18px; }
+.header { display: flex; align-items: center; gap: 13px; padding: 5px 0 1px; }
+.mark { display: grid; place-items: center; width: 44px; height: 44px; flex: none; border-radius: 14px; color: white; font-weight: 900; letter-spacing: -.08em; background: linear-gradient(145deg, var(--accent), #7758e8); box-shadow: 0 8px 26px #246bfe44; }
+.heading { min-width: 0; flex: 1; }
+h1 { margin: 0; overflow: hidden; font-size: clamp(21px, 4vw, 27px); line-height: 1.15; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; }
+#note { margin: 5px 0 0; color: var(--muted); font-size: 14px; white-space: pre-wrap; }
+.network-tag { flex: none; color: #a7b7d0; font-size: 12px; font-weight: 650; }
+.status {
+  display: flex; align-items: center; gap: 12px; min-height: 66px; padding: 13px 16px;
+  border: 1px solid var(--line); border-radius: 16px; background: #101722dd;
+  box-shadow: 0 12px 40px #0002;
+}
+.status-light { width: 11px; height: 11px; flex: none; border-radius: 50%; background: var(--red); box-shadow: 0 0 16px currentColor; color: var(--red); }
+.status-light.playing { background: var(--green); color: var(--green); }
+.status-light.paused, .status-light.ready { background: var(--amber); color: var(--amber); }
+.status-light.stopped { background: #8490a4; color: #8490a4; }
+#status-text { min-width: 0; flex: 1; font-size: 14px; font-weight: 700; }
+.live-pill { padding: 6px 9px; border: 1px solid #285e49; border-radius: 99px; color: #8df0c4; background: #123324; font-size: 11px; font-weight: 800; letter-spacing: .08em; white-space: nowrap; }
+.live-pill.off { border-color: #394456; color: #a5b0c1; background: #202938; }
+.panel { min-width: 0; padding: 17px; border: 1px solid var(--line); border-radius: 17px; background: linear-gradient(180deg, #141c29 0%, #101620 100%); box-shadow: 0 12px 36px #0002; }
+.panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0 0 13px; }
+h2 { margin: 0; color: #c5d0e2; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.hint { color: var(--muted); font-size: 12px; }
+.transport-grid, .grid { display: grid; grid-template-columns: repeat(var(--columns), minmax(0, 1fr)); gap: 10px; }
+.transport-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.play { background: var(--accent); box-shadow: 0 8px 22px color-mix(in srgb, var(--accent), transparent 74%); }
+.stop { background: #6d2633; border-color: #90414c; }
+.dark { background: #222d3d; border-color: #334158; }
+.button-label { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.button-icon { font-size: 16px; }
+.active-toggle { border-color: #7588a4; box-shadow: inset 0 0 0 1px #7588a4; }
+.section-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(310px, .85fr); gap: 16px; align-items: start; }
+.stack { display: grid; gap: 16px; min-width: 0; }
+.scene-grid { display: grid; grid-template-columns: repeat(var(--columns), minmax(0, 1fr)); gap: 9px; }
+.scene {
+  min-height: 68px; display: flex; align-items: center; gap: 11px; padding: 12px 14px;
+  text-align: left; background: #202a3a; border-color: #303c51;
+}
+.scene.live { border-color: var(--green); box-shadow: inset 0 0 0 1px var(--green), 0 0 18px #36d39918; background: #163126; }
+.scene-number, .position-number { display: grid; place-items: center; width: 34px; height: 34px; flex: none; border-radius: 11px; color: #dce8ff; background: #34445e; font-size: 12px; font-weight: 850; }
+.scene.live .scene-number { color: #07150f; background: var(--green); }
+.scene-name { min-width: 0; overflow-wrap: anywhere; }
+.scene-hotkey { margin-left: auto; color: #aab8cd; font-size: 11px; font-weight: 700; }
+.cue-grid { display: grid; grid-template-columns: repeat(var(--columns), minmax(0, 1fr)); gap: 9px; }
+.cue { min-height: 52px; padding: 10px 12px; border-color: #313e53; text-align: left; }
+.cue::before { content: "◆"; margin-right: 8px; color: var(--amber); }
+.cue.loop::before { content: "↻"; color: #54d9cb; }
+.cue small { display: block; margin: 2px 0 0; color: var(--muted); font-size: 11px; font-weight: 500; }
+.cue.live { border-color: #54d9cb; box-shadow: inset 0 0 0 1px #54d9cb; }
+.output-grid { display: grid; gap: 9px; }
+.output-card { display: flex; align-items: center; gap: 11px; min-width: 0; padding: 11px; border: 1px solid #2c394d; border-radius: 13px; background: #0e141e; }
+.position-number { width: 36px; height: 36px; color: #fff; background: var(--accent); border-radius: 50%; font-size: 16px; }
+.output-info { min-width: 0; flex: 1; }
+.output-info strong { display: block; overflow-wrap: anywhere; font-size: 13px; }
+.output-info span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.position-actions { display: flex; gap: 5px; }
+.position-actions button { min-width: 42px; min-height: 42px; padding: 6px; }
+.calibrate { width: 100%; margin-top: 11px; }
+#position-message, #action-message { min-height: 18px; margin: 9px 0 0; color: var(--muted); font-size: 12px; }
+#position-message.error, #action-message.error { color: #ff9ca8; }
+.volume-line { display: flex; align-items: center; gap: 13px; }
+.volume-icon { color: #bac7db; font-size: 18px; }
+input[type=range] { width: 100%; height: 34px; accent-color: var(--accent); cursor: pointer; }
+.volume-line input[type=range] { min-width: 0; width: 1%; flex: 1 1 auto; }
+#volume-value { min-width: 42px; color: #d9e4f5; font-size: 13px; font-weight: 750; text-align: right; }
+.now-playing { margin: 0 0 14px; padding: 14px; border: 1px solid #2a3c56; border-radius: 13px; background: linear-gradient(120deg, #162338, #121a27); }
+.now-playing-top, .now-playing-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.eyebrow { color: #9aacc8; font-size: 10px; font-weight: 850; letter-spacing: .13em; }
+#playback-state { color: #83e9bd; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+#playback-title { margin-top: 6px; overflow-wrap: anywhere; font-size: clamp(16px, 3vw, 20px); font-weight: 780; letter-spacing: -.02em; }
+.now-playing-meta { margin-top: 8px; color: #aab8cd; font-size: 12px; }
+#position-time { color: #e0e9f8; font-variant-numeric: tabular-nums; font-weight: 750; }
+.progress-track { height: 5px; margin-top: 11px; overflow: hidden; border-radius: 9px; background: #29364a; }
+#playback-progress { width: 0; height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s linear; }
+.audio-status { padding: 5px 8px; border: 1px solid #285e49; border-radius: 99px; color: #8df0c4; background: #123324; font-size: 10px; font-weight: 850; letter-spacing: .06em; white-space: nowrap; }
+.audio-status.muted { border-color: #70404b; color: #ffb4bd; background: #34202a; }
+.audio-status.silent { border-color: #66522f; color: #ffd68d; background: #322a1c; }
+.output-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.blackout-button { background: #622b37; border-color: #90414c; }
+.restore-button { background: #1c684b; border-color: #29825d; }
+.footer { color: #69778d; font-size: 11px; text-align: center; }
+.hidden { display: none !important; }
+@media (max-width: 760px) {
+  body { padding-left: 14px; padding-right: 14px; }
+  .section-grid { grid-template-columns: 1fr; }
+  .network-tag { display: none; }
+}
+@media (max-width: 520px) {
+  body { padding-left: 12px; padding-right: 12px; }
+  .panel { min-width: 0; padding: 13px; border-radius: 15px; }
+  .transport-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .scene-grid, .cue-grid { grid-template-columns: 1fr; }
+  .status { padding: 11px 12px; }
+  #status-text { font-size: 12px; }
+  .live-pill { font-size: 10px; }
+  button { min-height: 52px; }
+  .output-card { min-width: 0; gap: 8px; padding: 9px; }
+  .output-info { overflow-wrap: anywhere; }
+  .position-actions { gap: 4px; }
+}
+@media (max-width: 380px) {
+  body { padding-left: 9px; padding-right: 9px; }
+  .panel { padding: 11px; }
+  .header { gap: 9px; }
+  .mark { width: 38px; height: 38px; }
+  .panel-heading { align-items: flex-start; }
+  .panel-heading .hint { max-width: 46%; text-align: right; }
+  .position-actions button { min-width: 38px; min-height: 40px; padding: 5px; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
 </style>
 </head>
 <body>
-<h1 id="title">MapForge Live Control</h1>
-<p id="note" class="hidden"></p>
-<div id="status"><span class="dot"></span><span id="status-text">Connecting…</span></div>
+<main class="shell">
+  <header class="header">
+    <div class="mark" aria-hidden="true">MF</div>
+    <div class="heading">
+      <h1 id="title">MapForge Live Control</h1>
+      <p id="note" class="hidden"></p>
+    </div>
+    <span class="network-tag">LOCAL NETWORK</span>
+  </header>
 
-<button id="exit-loop" class="hidden" onclick="send('release')">Exit loop ⏭</button>
-
-<section id="transport">
-  <div class="grid">
-    <button onclick="send('play')">▶ Play</button>
-    <button class="dark" onclick="send('pause')">Ⅱ Pause</button>
-    <button class="stop" onclick="send('stop')">■ Stop</button>
-    <button class="dark" id="mute" onclick="send(state.muted ? 'unmute' : 'mute')">Mute</button>
+  <div class="status" role="status" aria-live="polite">
+    <span class="status-light" aria-hidden="true"></span>
+    <span id="status-text">Connecting to Player…</span>
+    <span id="live-pill" class="live-pill off">CONNECTING</span>
   </div>
-</section>
 
-<section id="scenes-section">
-  <h2>Scenes</h2>
-  <div id="scenes" class="grid"></div>
-</section>
+  <section id="transport" class="panel">
+    <div class="panel-heading"><h2>Playback</h2><span class="hint">Current scene and duration</span></div>
+    <div class="now-playing" aria-live="polite">
+      <div class="now-playing-top"><span class="eyebrow">NOW PLAYING</span><span id="playback-state">CONNECTING</span></div>
+      <div id="playback-title">Connecting to Player...</div>
+      <div class="now-playing-meta"><span>Position</span><span id="position-time">0:00 / 0:00</span></div>
+      <div class="progress-track" role="progressbar" aria-label="Scene playback progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="playback-progress"></div></div>
+    </div>
+    <div class="transport-grid">
+      <button class="play" onclick="send('play')"><span class="button-label"><span class="button-icon" aria-hidden="true">▶</span>Play</span></button>
+      <button class="dark" onclick="send('pause')"><span class="button-label"><span class="button-icon" aria-hidden="true">Ⅱ</span>Pause</span></button>
+      <button class="stop" onclick="send('stop')"><span class="button-label"><span class="button-icon" aria-hidden="true">■</span>Stop</span></button>
+      <button class="dark" id="mute" onclick="send(state.muted ? 'unmute' : 'mute')">Mute</button>
+    </div>
+    <button id="exit-loop" class="hidden calibrate dark" onclick="send('release')">Exit loop</button>
+    <p id="action-message" aria-live="polite"></p>
+  </section>
 
-<section id="cues-section" class="hidden">
-  <h2>◆ Cues</h2>
-  <div id="cues" class="grid"></div>
-</section>
+  <div class="section-grid">
+    <div class="stack">
+      <section id="scenes-section" class="panel">
+        <div class="panel-heading"><h2>Scenes</h2><span class="hint">Tap to take live</span></div>
+        <div id="scenes" class="scene-grid"></div>
+      </section>
+      <section id="cues-section" class="panel hidden">
+        <div class="panel-heading"><h2>Cues</h2></div>
+        <div id="cues" class="cue-grid"></div>
+      </section>
+      <section id="loops-section" class="panel hidden">
+        <div class="panel-heading"><h2>Loops</h2></div>
+        <div id="loops" class="cue-grid"></div>
+      </section>
+    </div>
 
-<section id="loops-section" class="hidden">
-  <h2>⟲ Loops</h2>
-  <div id="loops" class="grid"></div>
-</section>
+    <div class="stack">
+      <section id="position-section" class="panel">
+        <div class="panel-heading"><h2>Projector calibration</h2><span class="hint">Stage order</span></div>
+        <p class="hint">Show the numbers on the projectors, then move each output up or down to match the physical left-to-right order.</p>
+        <button id="identify-projectors" class="dark calibrate" onclick="toggleCalibration()">Show projector numbers</button>
+        <div id="positions" class="output-grid"></div>
+        <p id="position-message" aria-live="polite"></p>
+      </section>
 
-<section id="blackout-section">
-  <h2>Output</h2>
-  <div class="grid">
-    <button class="stop" id="blackout" onclick="send('blackout')">Blackout</button>
-    <button onclick="send('restore')">Restore</button>
+      <section id="volume-section" class="panel">
+        <div class="panel-heading"><h2>Master volume</h2><span id="audio-status" class="audio-status">SOUND ON</span></div>
+        <div class="volume-line"><span class="volume-icon" aria-hidden="true">♪</span><input id="volume" type="range" min="0" max="1" step=".01" value="1" aria-label="Master volume"><span id="volume-value">100%</span></div>
+      </section>
+
+      <section id="blackout-section" class="panel">
+        <div class="panel-heading"><h2>Output</h2><span class="hint">Live display</span></div>
+        <div class="output-actions">
+          <button class="blackout-button" id="blackout" onclick="send('blackout')">Blackout</button>
+          <button class="restore-button" onclick="send('restore')">Restore</button>
+        </div>
+      </section>
+    </div>
   </div>
-</section>
-
-<section id="volume-section">
-  <h2>Master volume <span id="volume-value"></span></h2>
-  <input id="volume" type="range" min="0" max="1" step=".01" value="1">
-</section>
-
-<small>This page talks only to the Player on your private network.</small>
+  <footer class="footer">MapForge controller · connected directly to this Player on your private network</footer>
+</main>
 
 <script>
 let state = {};
 let controller = { settings: {}, scenes: [] };
+let projectors = { outputs: [] };
+let positionSignature = '';
 let dragging = false;
+let refreshing = false;
 const $ = (id) => document.getElementById(id);
 const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
-const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const esc = (t) => String(t).replace(/[&<>\"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const formatTime = (seconds) => {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const whole = Math.floor(seconds);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+};
 
-async function send(path) {
-  try { await fetch('/api/' + path, { method: 'POST' }); } catch (e) {}
-  refresh();
+function setMessage(id, text, error = false) {
+  const node = $(id);
+  node.textContent = text;
+  node.classList.toggle('error', error);
 }
 
-const volume = $('volume');
-volume.addEventListener('input', () => { dragging = true; $('volume-value').textContent = Math.round(volume.value * 100) + '%'; send('volume/' + volume.value); });
-volume.addEventListener('change', () => { dragging = false; });
+async function send(path) {
+  setMessage('action-message', 'Sending command…');
+  try {
+    const response = await fetch('/api/' + path, { method: 'POST', cache: 'no-store' });
+    if (!response.ok) throw new Error(await response.text() || `Command failed (${response.status})`);
+    setMessage('action-message', 'Command sent.');
+    await refresh();
+  } catch (error) {
+    setMessage('action-message', error.message || 'Could not reach the Player.', true);
+  }
+}
+
+async function postJson(path, body) {
+  const response = await fetch('/api/' + path, {
+    method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  if (!response.ok) throw new Error(await response.text() || `Request failed (${response.status})`);
+}
+
+async function toggleCalibration() {
+  setMessage('position-message', 'Updating projector calibration…');
+  try {
+    const response = await fetch('/api/calibration', { method: 'POST', cache: 'no-store' });
+    if (!response.ok) throw new Error(await response.text() || `Request failed (${response.status})`);
+    setMessage('position-message', projectors.identifying ? 'Projector numbers hidden.' : 'Projector numbers are showing.');
+    positionSignature = '';
+    await refresh();
+  } catch (error) {
+    setMessage('position-message', error.message || 'Could not change calibration.', true);
+  }
+}
+
+async function moveProjector(id, direction) {
+  const outputs = [...(projectors.outputs || [])].sort((a, b) => a.position - b.position);
+  const index = outputs.findIndex((output) => output.id === id);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= outputs.length) return;
+  [outputs[index], outputs[target]] = [outputs[target], outputs[index]];
+  setMessage('position-message', 'Applying projector order…');
+  try {
+    await postJson('projector-order', { order: outputs.map((output) => output.id) });
+    setMessage('position-message', 'Projector order updated.');
+    positionSignature = '';
+    await refresh();
+  } catch (error) {
+    setMessage('position-message', error.message || 'Could not change projector order.', true);
+    await refresh();
+  }
+}
+
+function applyProjectors() {
+  const outputs = projectors.outputs || [];
+  $('position-section').classList.toggle('hidden', outputs.length === 0);
+  const signature = JSON.stringify([outputs, projectors.identifying]);
+  if (signature === positionSignature) return;
+  positionSignature = signature;
+  const ordered = [...outputs].sort((a, b) => a.position - b.position);
+  const identify = $('identify-projectors');
+  identify.textContent = projectors.identifying ? 'Hide projector numbers' : 'Show projector numbers';
+  identify.classList.toggle('active-toggle', !!projectors.identifying);
+  identify.setAttribute('aria-pressed', String(!!projectors.identifying));
+  $('positions').innerHTML = ordered.map((output, index) =>
+    `<div class="output-card"><span class="position-number">${index + 1}</span><div class="output-info"><strong>${esc(output.name)} · #${output.number}</strong><span>Stage position ${index + 1} · X ${Math.round(output.x)} px · Y ${Math.round(output.y)} px</span></div>` +
+    `<div class="position-actions"><button class="dark" aria-label="Move ${esc(output.name)} left" title="Move left" onclick="moveProjector('${output.id}',-1)" ${index === 0 ? 'disabled' : ''}>←</button>` +
+    `<button class="dark" aria-label="Move ${esc(output.name)} right" title="Move right" onclick="moveProjector('${output.id}',1)" ${index === ordered.length - 1 ? 'disabled' : ''}>→</button></div></div>`
+  ).join('');
+}
 
 function applySettings() {
-  const s = controller.settings;
+  const s = controller.settings || {};
   document.title = s.title || 'MapForge Control';
   $('title').textContent = s.title || 'MapForge Live Control';
   $('note').textContent = s.note || '';
   $('note').classList.toggle('hidden', !s.note);
   if (s.accent) document.documentElement.style.setProperty('--accent', rgb(s.accent));
-  document.documentElement.style.setProperty('--columns', s.columns || 2);
+  document.documentElement.style.setProperty('--columns', Math.max(1, Math.min(4, s.columns || 2)));
   $('transport').classList.toggle('hidden', s.show_transport === false);
   $('scenes-section').classList.toggle('hidden', s.show_scenes === false || controller.scenes.length === 0);
   $('blackout-section').classList.toggle('hidden', s.show_blackout === false);
   $('volume-section').classList.toggle('hidden', s.show_volume === false);
-  const scenes = controller.scenes;
+  const scenes = controller.scenes || [];
   const many = scenes.length > 1;
   const color = (c) => c ? 'background:' + rgb(c) : '';
-  const key = (k) => k ? '<b>' + esc(k) + '</b>' : '';
-  // Scene name in front of cue and loop labels when the show has several scenes.
-  const owner = (scene) => many ? `<small>${esc(scene.label)} ›</small> ` : '';
-  $('scenes').innerHTML = scenes.map((scene) =>
+  const key = (k) => k ? `<span class="scene-hotkey">${esc(k)}</span>` : '';
+  const owner = (scene) => many ? `<small>${esc(scene.label)} ›</small>` : '';
+  $('scenes').innerHTML = scenes.map((scene, index) =>
     `<button class="scene${scene.id === state.scene_id ? ' live' : ''}" style="${color(scene.color)}" onclick="send('scene/${scene.index}')">` +
-    `${key(scene.hotkey)}${esc(scene.label)}</button>`).join('');
+    `<span class="scene-number">${String(index + 1).padStart(2, '0')}</span><span class="scene-name">${esc(scene.label)}</span>${key(scene.hotkey)}</button>`
+  ).join('');
   const cues = scenes.flatMap((scene) => (scene.cues || []).map((cue) =>
-    `<button class="cue" style="${color(cue.color)}" onclick="send('cue/${scene.index}/${cue.index}')">` +
-    `${key(cue.hotkey)}${owner(scene)}${esc(cue.label)}</button>`));
+    `<button class="cue" style="${color(cue.color)}" onclick="send('cue/${scene.index}/${cue.index}')">${owner(scene)}${esc(cue.label)}${key(cue.hotkey)}</button>`));
   const loops = scenes.flatMap((scene) => (scene.loops || []).map((loop) =>
-    `<button class="cue loop${state.loop_name === loop.name ? ' live' : ''}" style="${color(loop.color)}" onclick="send('loop/${scene.index}/${loop.index}')">` +
-    `${key(loop.hotkey)}${owner(scene)}${esc(loop.label)}</button>`));
+    `<button class="cue loop${state.loop_name === loop.name ? ' live' : ''}" style="${color(loop.color)}" onclick="send('loop/${scene.index}/${loop.index}')">${owner(scene)}${esc(loop.label)}${key(loop.hotkey)}</button>`));
   $('cues').innerHTML = cues.join('');
   $('loops').innerHTML = loops.join('');
   $('cues-section').classList.toggle('hidden', s.show_scenes === false || cues.length === 0);
   $('loops-section').classList.toggle('hidden', s.show_scenes === false || loops.length === 0);
 }
 
-async function refresh() {
+async function setVolume() {
+  const percent = Math.round(Number($('volume').value) * 100);
+  setMessage('action-message', `Setting volume to ${percent}%…`);
   try {
-    state = await (await fetch('/api/state')).json();
-    controller = await (await fetch('/api/controller')).json();
-    const t = state.transport;
-    document.querySelector('.dot').className = 'dot ' + t;
-    $('status-text').textContent = `${t.toUpperCase()} · ${state.blackout ? 'BLACKOUT' : 'Output live'} · ${state.muted ? 'Muted' : 'Volume ' + Math.round(state.volume * 100) + '%'}`;
-    const offline = (state.followers || []).filter((f) => !f.online);
-    if (offline.length) $('status-text').textContent += ` · ⚠ OFFLINE: ${offline.map((f) => f.address.split(':')[0]).join(', ')}`;
-    else if ((state.followers || []).length) $('status-text').textContent += ` · All ${state.followers.length + 1} PCs online`;
-    $('mute').textContent = state.muted ? 'Unmute' : 'Mute';
-    $('exit-loop').classList.toggle('hidden', !state.loop_name);
-    if (state.loop_name) $('exit-loop').textContent = `Exit loop “${state.loop_name}” ⏭`;
-    $('blackout').classList.toggle('on', state.blackout);
-    if (!dragging) { volume.value = state.volume; $('volume-value').textContent = Math.round(state.volume * 100) + '%'; }
-    applySettings();
-  } catch (e) {
-    document.querySelector('.dot').className = 'dot';
-    $('status-text').textContent = 'Player offline';
+    const response = await fetch(`/api/volume/${Number($('volume').value).toFixed(2)}`, { method: 'POST', cache: 'no-store' });
+    if (!response.ok) throw new Error(await response.text() || `Request failed (${response.status})`);
+    setMessage('action-message', `Volume set to ${percent}%.`);
+    await refresh();
+  } catch (error) {
+    setMessage('action-message', error.message || 'Could not change volume.', true);
   }
 }
-setInterval(refresh, 1000);
+
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    const opts = { cache: 'no-store' };
+    const [stateResponse, controllerResponse, projectorResponse] = await Promise.all([
+      fetch('/api/state', opts), fetch('/api/controller', opts), fetch('/api/projectors', opts)
+    ]);
+    if (!stateResponse.ok || !controllerResponse.ok || !projectorResponse.ok) throw new Error('Player unavailable');
+    state = await stateResponse.json();
+    controller = await controllerResponse.json();
+    projectors = await projectorResponse.json();
+    const t = state.transport || 'offline';
+    document.querySelector('.status-light').className = 'status-light ' + t;
+    const offline = (state.followers || []).filter((f) => !f.online);
+    let label = `${t.toUpperCase()} · ${state.blackout ? 'BLACKOUT' : 'OUTPUT LIVE'} · ${state.muted ? 'MUTED' : 'VOLUME ' + Math.round(state.volume * 100) + '%'}`;
+    if (offline.length) label += ` · OFFLINE: ${offline.map((f) => f.address.split(':')[0]).join(', ')}`;
+    else if ((state.followers || []).length) label += ` · ${state.followers.length + 1} PLAYERS ONLINE`;
+    $('status-text').textContent = label;
+    const liveScene = (controller.scenes || []).find((scene) => scene.id === state.scene_id);
+    const currentScene = controller.current_scene;
+    $('live-pill').textContent = liveScene ? liveScene.label : t === 'offline' ? 'OFFLINE' : t.toUpperCase();
+    $('live-pill').classList.toggle('off', !liveScene || t !== 'playing');
+    $('playback-title').textContent = currentScene?.label || 'No scene selected';
+    $('playback-state').textContent = state.loop_name ? `LOOPING · ${state.loop_name}` : t.toUpperCase();
+    const duration = Number(currentScene?.duration_seconds);
+    const position = Number(state.position_seconds);
+    $('position-time').textContent = `${formatTime(position)} / ${formatTime(duration)}`;
+    const progress = duration > 0 ? Math.max(0, Math.min(100, position / duration * 100)) : 0;
+    $('playback-progress').style.width = `${progress}%`;
+    $('playback-progress').parentElement.setAttribute('aria-valuenow', String(Math.round(progress)));
+    $('mute').textContent = state.muted ? 'Unmute' : 'Mute';
+    $('mute').classList.toggle('active-toggle', !!state.muted);
+    $('mute').setAttribute('aria-pressed', String(!!state.muted));
+    $('exit-loop').classList.toggle('hidden', !state.loop_name);
+    if (state.loop_name) $('exit-loop').textContent = `Exit loop · ${state.loop_name}`;
+    $('blackout').classList.toggle('active-toggle', !!state.blackout);
+    if (!dragging) {
+      $('volume').value = state.volume;
+      $('volume-value').textContent = Math.round(state.volume * 100) + '%';
+    }
+    const audioStatus = $('audio-status');
+    const volumePercent = Math.round(Number(state.volume || 0) * 100);
+    audioStatus.textContent = state.muted ? 'MUTED' : volumePercent === 0 ? 'VOLUME 0' : 'SOUND ON';
+    audioStatus.classList.toggle('muted', !!state.muted);
+    audioStatus.classList.toggle('silent', !state.muted && volumePercent === 0);
+    audioStatus.title = state.muted ? `Muted · slider at ${volumePercent}%` : `Unmuted · ${volumePercent}% volume`;
+    applySettings();
+    applyProjectors();
+  } catch (error) {
+    document.querySelector('.status-light').className = 'status-light';
+    $('status-text').textContent = 'PLAYER OFFLINE · CHECK THE NETWORK CONNECTION';
+    $('live-pill').textContent = 'OFFLINE';
+    $('live-pill').classList.add('off');
+  } finally {
+    refreshing = false;
+  }
+}
+
+const volume = $('volume');
+volume.addEventListener('pointerdown', () => { dragging = true; });
+volume.addEventListener('input', () => { $('volume-value').textContent = Math.round(Number(volume.value) * 100) + '%'; });
+volume.addEventListener('change', () => { dragging = false; setVolume(); });
+volume.addEventListener('pointerup', () => { dragging = false; });
+setInterval(refresh, 1200);
 refresh();
 </script>
 </body>

@@ -29,6 +29,7 @@ Updated: 2026-10-01
 - Edge blending uses a complementary ramp (seam level, curve, projector gamma) so overlapping light sums to 100%; per-projector brightness and black-level lift; the Producer plots the blend and flags unblended overlaps.
 - White, 50% gray and stage-space grid test patterns for alignment and blend tuning.
 - Four-corner perspective correction uses a projective homography. Corners can be dragged in a calibration preview or entered numerically; media uses a subdivided texture mesh and calibration grids follow the correction.
+- Projector geometry editor offers Off, Perspective, Horizontal curve, Vertical curve and Full grid modes. Curved modes use a draggable 3×3 mesh in the Player render path; horizontal and vertical modes constrain movement to the relevant axis, and Reset geometry restores a flat output. Existing show files keep their prior perspective behavior through serde defaults.
 - Per-projector polygon masks support 3–64 editable output-space points. The Player triangulates the area outside the polygon and blacks it out after rendering.
 - Web controller customisable from the Producer: title, note, accent colour, columns, visible sections, and per-scene button text, colour and visibility.
 - Show mode: on first start each Player asks whether it is the master or a sub (subs enter the master's IP) and saves the answer. Every Player keeps the last show it received and reopens it on start. The master can autostart the first scene once every sub answers (or after 20 s), relays iPad commands to the subs with a clock-adjusted start 0.8 s ahead (clock offset taken from the quickest of several round trips), and brings a restarted sub back to the same position. Subs copy the show and missing media from the master (SHA-256 checked) and pass iPad taps to it. Sound plays on the master only unless enabled for every PC. Ports can be moved with `MAPFORGE_PORT` and `MAPFORGE_HTTP_PORT` to test two Players on one machine.
@@ -42,13 +43,13 @@ Updated: 2026-10-01
 ## Prototype limitations
 
 - FFmpeg must be installed on the Player PC for video playback; still images work without it.
-- Video is decoded on the CPU at up to 1920 px wide and 30 fps, and audio/video sync is wall-clock based rather than frame-accurate. Hardware decode is not implemented yet.
+- Video is decoded on the CPU at its own resolution (down to the GPU's largest texture, usually 16384 px) at 30 fps, and audio/video sync is wall-clock based rather than frame-accurate. Hardware decode is not implemented yet.
 - Scheduled multi-PC starts compensate for measured wall-clock offsets, but there is no continuous drift correction yet. Long scenes can separate as hardware clocks drift, and the current 10 ms scheduler is not frame-lock or genlock.
 - The first controller uses HTTP polling rather than the planned WebSocket channel.
 - No authentication is enabled; use only on a trusted private LAN.
 - Blending is drawn as black-alpha overlays in the simulated windows; a linear-light GPU shader is still planned. Black-level lift is a uniform raise outside the feathers.
-- Cross-PC clock sync, transitions, GPU telemetry, multi-point warp meshes and feathered masks are not implemented.
-- Polygon masks are currently hard-edged. Perspective texture sampling uses a 16×16 subdivided mesh; a future dedicated GPU render pass should replace this approximation and combine warp, mask, colour and blending.
+- Cross-PC clock sync, transitions, GPU telemetry, warp meshes larger than the built-in 3×3 grid, and feathered masks are not implemented.
+- Polygon masks are currently hard-edged. Perspective and 3×3 mesh texture sampling use subdivided meshes; a future dedicated GPU render pass should combine warp, mask, colour and blending.
 - Physical display enumeration and borderless placement compile for Windows, but still require validation on the user's actual display topology, GPU and projectors. Mixed-DPI Windows layouts need particular testing.
 - Windows execution still needs testing on the user's actual PC; local tests only prove the current development platform build.
 

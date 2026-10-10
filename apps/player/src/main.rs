@@ -10,7 +10,7 @@ use eframe::egui;
 use mapforge_core::{
     net::unix_time_ms, player_host, scene_hotkey, tool_command, Asset, AssetKind, AssetStatus,
     Command, DisplayInfo, EndAction, Envelope, Layer, LoopRegion, PlayerRole, PlayerState,
-    ProjectorOutput, Scene, ShowProject, TestPattern, Transport, CONTROLLER_PORT,
+    ProjectorOutput, Scene, ShowProject, TestPattern, Transport, WarpMode, CONTROLLER_PORT,
     DEFAULT_PLAYER_PORT, PROTOCOL_VERSION,
 };
 use relay::Relay;
@@ -25,7 +25,7 @@ use std::{
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError},
         Arc, Mutex, OnceLock,
     },
@@ -36,9 +36,26 @@ use uuid::Uuid;
 
 const CONTROLLER_HTML: &str = include_str!("controller.html");
 const VIDEO_FPS: f64 = 30.0;
-const MAX_VIDEO_DECODE_WIDTH: u32 = 1920;
-const MAX_IMAGE_SIZE: u32 = 4096;
+/// Largest texture side the GPU accepts, read from OpenGL at start-up. Media
+/// is decoded at its own resolution so panoramas spanning several projectors
+/// stay sharp; only media wider or taller than this is scaled down, because
+/// uploading a larger texture would crash the renderer.
+static TEXTURE_LIMIT: AtomicU32 = AtomicU32::new(8192);
 const AUDIO_RATE: u32 = 48_000;
+
+fn texture_limit() -> u32 {
+    TEXTURE_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Decode size for media of `width` × `height`: unchanged when it fits the
+/// GPU, otherwise shrunk to fit while keeping its shape. Both sides are even,
+/// as video codecs and FFmpeg's scaler prefer.
+fn fit_within(width: u32, height: u32, limit: u32) -> (usize, usize) {
+    let (width, height) = (width.max(2) as f64, height.max(2) as f64);
+    let scale = (limit as f64 / width).min(limit as f64 / height).min(1.0);
+    let even = |v: f64| ((v * scale / 2.0).round() as usize * 2).max(2);
+    (even(width), even(height))
+}
 /// How long before a scene ends its next pass is started in the background.
 const PREROLL_SECONDS: f64 = 2.0;
 
@@ -96,6 +113,8 @@ struct Runtime {
     port: u16,
     /// This PC's LAN addresses, to find its own projectors in a show.
     local_ips: Vec<String>,
+    /// A controller edit to hand back to Producer on its next state poll.
+    project_update_pending: bool,
     /// Sub: how the link to the master is doing.
     link_note: String,
     scheduled: Option<ScheduledStart>,
@@ -278,7 +297,16 @@ impl Runtime {
         {
             return Some((scene.id, region.start, region.end));
         }
-        Some((self.upcoming_scene()?, 0.0, scene.duration()))
+        let end = scene.duration();
+        match scene.end_action {
+            EndAction::Loop => Some((scene.id, self.visual_loop_start(scene), end)),
+            EndAction::Next => {
+                let project = self.project.as_ref()?;
+                let index = project.scenes.iter().position(|s| s.id == scene.id)?;
+                Some((project.scenes.get(index + 1)?.id, 0.0, end))
+            }
+            EndAction::Hold | EndAction::Stop => None,
+        }
     }
 
     /// The clock as the outputs should show it. Between passing the scene
@@ -299,24 +327,37 @@ impl Runtime {
             return position;
         }
         match scene.end_action {
-            EndAction::Loop => position % end,
+            EndAction::Loop => {
+                let start = self.visual_loop_start(scene);
+                let span = (end - start).max(0.001);
+                start + (position - end).rem_euclid(span)
+            }
             EndAction::Hold => end - 0.001,
             EndAction::Stop | EndAction::Next => position,
         }
     }
 
-    /// The scene to pre-roll as the current one nears its end.
-    fn upcoming_scene(&self) -> Option<Uuid> {
-        let scene = self.scene()?;
-        match scene.end_action {
-            EndAction::Loop => Some(scene.id),
-            EndAction::Next => {
-                let scenes = &self.project.as_ref()?.scenes;
-                let index = scenes.iter().position(|s| s.id == scene.id)?;
-                scenes.get(index + 1).map(|s| s.id)
-            }
-            EndAction::Hold | EndAction::Stop => None,
-        }
+    /// Whole-scene loops skip a leading blank interval on repeats. An
+    /// explicitly drawn timeline loop still uses its exact authored start.
+    fn visual_loop_start(&self, scene: &Scene) -> f64 {
+        let Some(project) = &self.project else {
+            return 0.0;
+        };
+        scene
+            .layers
+            .iter()
+            .filter(|layer| {
+                project
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == layer.asset_id)
+                    .is_some_and(|asset| {
+                        matches!(asset.kind, AssetKind::Image | AssetKind::Video)
+                    })
+            })
+            .map(|layer| layer.timeline_start.max(0.0))
+            .min_by(f64::total_cmp)
+            .unwrap_or(0.0)
     }
 
     fn scene(&self) -> Option<&Scene> {
@@ -425,19 +466,20 @@ impl Runtime {
         if end <= 0.0 || self.clock.position() < end {
             return;
         }
-        let (scene_id, action) = (scene.id, scene.end_action);
+        let (scene_id, action, loop_start) =
+            (scene.id, scene.end_action, self.visual_loop_start(scene));
         match action {
             EndAction::Loop => {
                 if let Some(project) = &self.project {
-                    media.sync(project, scene_id, true, 0.0);
+                    media.sync(project, scene_id, true, loop_start);
                 }
                 // Keep the few milliseconds past the end so timing never drifts.
                 let overflow = (self.clock.position() - end).clamp(0.0, 0.05);
                 self.clock = Clock {
-                    base: overflow,
+                    base: loop_start + overflow,
                     since: Some(Instant::now()),
                 };
-                self.reset_loops(overflow);
+                self.reset_loops(loop_start + overflow);
             }
             EndAction::Hold => {
                 self.clock = Clock {
@@ -466,12 +508,21 @@ impl Runtime {
     }
 }
 
+/// One picture ready for the GPU. It is already in egui's pixel layout, so
+/// the UI thread hands it to the texture without converting or copying it.
 #[derive(Clone)]
 struct DecodedFrame {
-    width: usize,
-    height: usize,
-    rgba: Arc<Vec<u8>>,
+    image: Arc<egui::ColorImage>,
     sequence: u64,
+}
+
+/// What this PC shows: the projectors it draws (all when `None`) and the
+/// quality chosen in the Player window. Together with the GPU's limit this
+/// decides how much of each layer is decoded, and how large.
+#[derive(Clone, Default)]
+struct DecodeView {
+    outputs: Option<Vec<Uuid>>,
+    max_side: u32,
 }
 
 /// Everything a layer's decoders were started with; a change restarts them.
@@ -482,18 +533,48 @@ struct LayerSpec {
     source_offset: f64,
     timeline_start: f64,
     audio: bool,
+    /// The part of the media this PC's projectors show, in media pixels
+    /// (x, y, width, height). `None` decodes the whole picture. A panorama
+    /// spanning several PCs is decoded by each PC only where it is shown, so
+    /// it plays at full resolution without decoding the parts other PCs show.
+    crop: Option<[u32; 4]>,
+    /// The crop as texture coordinates of the whole media.
+    uv: [f32; 4],
+    /// No projector on this PC shows this layer, so no picture is decoded.
+    hidden: bool,
+    /// Longest side after decoding: the GPU's limit and the quality setting.
+    max_side: u32,
 }
 
 impl LayerSpec {
-    fn new(layer: &Layer, asset: &Asset) -> Self {
+    fn new(layer: &Layer, asset: &Asset, outputs: &[&ProjectorOutput], max_side: u32) -> Self {
         let mut asset = asset.clone();
         asset.path = resolve_media(&asset).to_string_lossy().to_string();
+        let visual = matches!(asset.kind, AssetKind::Image | AssetKind::Video);
+        let shown = visible_part(layer, outputs);
+        let crop = match (shown, asset.width, asset.height) {
+            (Some(part), Some(w), Some(h)) if visual => media_crop(layer, part, w, h),
+            _ => None,
+        };
+        let uv = match (crop, asset.width, asset.height) {
+            (Some([x, y, w, h]), Some(mw), Some(mh)) => [
+                x as f32 / mw as f32,
+                y as f32 / mh as f32,
+                (x + w) as f32 / mw as f32,
+                (y + h) as f32 / mh as f32,
+            ],
+            _ => [0.0, 0.0, 1.0, 1.0],
+        };
         Self {
             asset,
             looping: layer.looping,
             source_offset: layer.source_offset,
             timeline_start: layer.timeline_start,
             audio: layer.audio,
+            crop,
+            uv,
+            hidden: visual && shown.is_none(),
+            max_side: max_side.min(texture_limit()),
         }
     }
 
@@ -507,22 +588,85 @@ impl LayerSpec {
     }
 }
 
+/// The stage rectangle (left, top, right, bottom) where `outputs` show the
+/// layer: the layer's rectangle cut to the box around the projectors routed
+/// to it. `None` when none of them shows it.
+fn visible_part(layer: &Layer, outputs: &[&ProjectorOutput]) -> Option<[f32; 4]> {
+    let mut shown: Option<[f32; 4]> = None;
+    for output in outputs
+        .iter()
+        .filter(|o| layer.output_ids.contains(&o.id))
+    {
+        let rect = [
+            output.stage_x,
+            output.stage_y,
+            output.stage_x + output.stage_width,
+            output.stage_y + output.stage_height,
+        ];
+        shown = Some(match shown {
+            None => rect,
+            Some(s) => [
+                s[0].min(rect[0]),
+                s[1].min(rect[1]),
+                s[2].max(rect[2]),
+                s[3].max(rect[3]),
+            ],
+        });
+    }
+    let s = shown?;
+    let part = [
+        s[0].max(layer.x),
+        s[1].max(layer.y),
+        s[2].min(layer.x + layer.width),
+        s[3].min(layer.y + layer.height),
+    ];
+    (part[2] > part[0] && part[3] > part[1]).then_some(part)
+}
+
+/// The media pixels (x, y, width, height) behind the stage rectangle `part`
+/// of the layer, with a small margin, on even pixel boundaries. `None` when
+/// that is the whole picture anyway.
+fn media_crop(layer: &Layer, part: [f32; 4], width: u32, height: u32) -> Option<[u32; 4]> {
+    const MARGIN: f32 = 4.0;
+    if layer.width <= 0.0 || layer.height <= 0.0 || width < 2 || height < 2 {
+        return None;
+    }
+    let (w, h) = (width as f32, height as f32);
+    let span = |from: f32, to: f32, origin: f32, size: f32, pixels: f32| {
+        let lo = ((from - origin) / size * pixels - MARGIN).floor().max(0.0);
+        let hi = ((to - origin) / size * pixels + MARGIN).ceil().min(pixels);
+        // Even edges, as video codecs and FFmpeg's scaler prefer.
+        let lo = (lo as u32) / 2 * 2;
+        let hi = ((hi as u32).div_ceil(2) * 2).min(pixels as u32).max(lo + 2);
+        (lo, hi)
+    };
+    let (x0, x1) = span(part[0], part[2], layer.x, layer.width, w);
+    let (y0, y1) = span(part[1], part[3], layer.y, layer.height, h);
+    if x0 == 0 && y0 == 0 && x1 >= width && y1 >= height {
+        return None;
+    }
+    Some([x0, y0, (x1 - x0).min(width - x0), (y1 - y0).min(height - y0)])
+}
+
 #[derive(Default)]
 struct Decoder {
     latest: Mutex<Option<DecodedFrame>>,
     error: Mutex<Option<String>>,
+    /// What is being decoded and at what size, for the Player window.
+    info: Mutex<String>,
     cancelled: AtomicBool,
     /// True while the show clock is inside this clip and playing.
     active: AtomicBool,
 }
 
 impl Decoder {
-    fn publish(&self, width: usize, height: usize, rgba: Vec<u8>, sequence: u64) {
+    /// Every frame gets a number no other frame ever had, so a restarted
+    /// decoder's first frame is never mistaken for the old one.
+    fn publish(&self, image: egui::ColorImage) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         *self.latest.lock().unwrap() = Some(DecodedFrame {
-            width,
-            height,
-            rgba: Arc::new(rgba),
-            sequence,
+            image: Arc::new(image),
+            sequence: NEXT.fetch_add(1, Ordering::Relaxed),
         });
     }
 
@@ -530,17 +674,50 @@ impl Decoder {
         *self.error.lock().unwrap() = Some(message);
     }
 
-    fn decode_image(&self, asset: &Asset) {
+    /// Describes the decode for the Player window: the source size, the part
+    /// of it this PC shows, and whether it was scaled down.
+    fn describe(&self, spec: &LayerSpec, source: (u32, u32), decoded: (usize, usize)) {
+        let (sw, sh) = source;
+        let part = match spec.crop {
+            Some([_, _, w, h]) => format!("{w}×{h} part of {sw}×{sh}"),
+            None => format!("{sw}×{sh}"),
+        };
+        let (cw, ch) = spec.crop.map_or((sw, sh), |[_, _, w, h]| (w, h));
+        let size = if decoded == (cw as usize, ch as usize) {
+            "full resolution".to_owned()
+        } else {
+            format!("scaled down to {}×{}", decoded.0, decoded.1)
+        };
+        *self.info.lock().unwrap() = format!("{}: {part}, {size}", spec.asset.name);
+    }
+
+    fn decode_image(&self, spec: &LayerSpec) {
+        let asset = &spec.asset;
         match image::open(&asset.path) {
             Ok(image) => {
-                let image = if image.width() > MAX_IMAGE_SIZE || image.height() > MAX_IMAGE_SIZE {
-                    image.thumbnail(MAX_IMAGE_SIZE, MAX_IMAGE_SIZE)
+                let source = (image.width(), image.height());
+                let image = match spec.crop {
+                    Some([x, y, w, h]) if x + w <= image.width() && y + h <= image.height() => {
+                        image.crop_imm(x, y, w, h)
+                    }
+                    _ => image,
+                };
+                let limit = spec.max_side;
+                let image = if image.width() > limit || image.height() > limit {
+                    let (w, h) = fit_within(image.width(), image.height(), limit);
+                    image.resize_exact(w as u32, h as u32, image::imageops::FilterType::Triangle)
                 } else {
                     image
                 };
+                self.describe(
+                    spec,
+                    source,
+                    (image.width() as usize, image.height() as usize),
+                );
                 let rgba = image.to_rgba8();
-                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-                self.publish(w, h, rgba.into_raw(), 1);
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                // Pictures may be transparent, so their alpha is honoured.
+                self.publish(egui::ColorImage::from_rgba_unmultiplied(size, &rgba));
             }
             Err(error) => self.fail(format!("{}: image decode failed: {error}", asset.name)),
         }
@@ -551,19 +728,30 @@ impl Decoder {
     /// the same frame.
     fn decode_video(&self, spec: &LayerSpec, start: f64) {
         let asset = &spec.asset;
-        let source_width = asset.width.unwrap_or(1280).max(2);
-        let source_height = asset.height.unwrap_or(720).max(2);
-        let width = (source_width.min(MAX_VIDEO_DECODE_WIDTH) / 2 * 2).max(2) as usize;
-        let height = ((width as f64 * source_height as f64 / source_width as f64 / 2.0).round()
-            as usize
-            * 2)
-        .max(2);
+        // The size comes from the show; a file Producer could not read is
+        // measured here rather than forced to 1280×720.
+        let (source_width, source_height) = match (asset.width, asset.height) {
+            (Some(w), Some(h)) if w >= 2 && h >= 2 => (w, h),
+            _ => probe_size(&asset.path).unwrap_or((1280, 720)),
+        };
+        // Only the part this PC shows is decoded; cropping is free in FFmpeg.
+        let (crop, part_width, part_height) = match spec.crop {
+            Some([x, y, w, h]) if x + w <= source_width && y + h <= source_height => {
+                (format!("crop={w}:{h}:{x}:{y},"), w, h)
+            }
+            _ => (String::new(), source_width, source_height),
+        };
+        let (width, height) = fit_within(part_width, part_height, spec.max_side);
+        self.describe(spec, (source_width, source_height), (width, height));
         let mut command = ffmpeg_input(&asset.path, spec.looping, start);
+        // The scale filter also does the RGBA conversion, so at the same size
+        // it costs nothing extra, and it pins the frame size read below even
+        // for odd-sized or rotated files.
         command
             .args([
                 "-an",
                 "-vf",
-                &format!("scale={width}:{height}"),
+                &format!("{crop}scale={width}:{height}"),
                 "-r",
                 &VIDEO_FPS.to_string(),
                 "-pix_fmt",
@@ -604,7 +792,9 @@ impl Decoder {
                 break;
             }
             sequence += 1;
-            self.publish(width, height, rgba, sequence);
+            // Video is opaque, so its bytes are already egui's premultiplied
+            // layout: this is a straight copy rather than a per-pixel multiply.
+            self.publish(egui::ColorImage::from_rgba_premultiplied([width, height], &rgba));
             next_frame += frame_time;
             let now = Instant::now();
             if next_frame > now {
@@ -616,6 +806,28 @@ impl Decoder {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// The picture size of a video file, from FFprobe.
+fn probe_size(path: &str) -> Option<(u32, u32)> {
+    let output = tool_command("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let stream = value.get("streams")?.get(0)?;
+    let side = |key: &str| stream.get(key)?.as_u64().map(|v| v as u32);
+    Some((side("width")?, side("height")?))
 }
 
 fn ffmpeg_input(path: &str, looping: bool, start: f64) -> ProcessCommand {
@@ -776,18 +988,6 @@ impl Slot {
     }
 }
 
-fn layer_specs(project: &ShowProject, scene_id: Uuid) -> HashMap<Uuid, LayerSpec> {
-    let mut specs = HashMap::new();
-    if let Some(scene) = project.scenes.iter().find(|s| s.id == scene_id) {
-        for layer in &scene.layers {
-            if let Some(asset) = project.assets.iter().find(|a| a.id == layer.asset_id) {
-                specs.insert(layer.id, LayerSpec::new(layer, asset));
-            }
-        }
-    }
-    specs
-}
-
 /// Decoders for every layer of the prepared scene, keyed by layer id.
 #[derive(Default)]
 struct MediaPool {
@@ -795,13 +995,48 @@ struct MediaPool {
     /// Media pre-rolled for the scene that plays next (or this one again).
     standby: Mutex<Option<(Uuid, f64, HashMap<Uuid, Slot>)>>,
     audio_output: Option<rodio::OutputStreamHandle>,
+    view: Mutex<DecodeView>,
 }
 
 impl MediaPool {
+    /// Which projectors this PC draws and the quality setting; the next
+    /// `sync` restarts the layers whose decode changes because of it.
+    fn set_view(&self, outputs: Option<Vec<Uuid>>, quality: setup::Quality) {
+        *self.view.lock().unwrap() = DecodeView {
+            outputs,
+            max_side: quality.max_side(),
+        };
+    }
+
+    fn set_quality(&self, quality: setup::Quality) {
+        self.view.lock().unwrap().max_side = quality.max_side();
+    }
+
+    fn layer_specs(&self, project: &ShowProject, scene_id: Uuid) -> HashMap<Uuid, LayerSpec> {
+        let view = self.view.lock().unwrap().clone();
+        let outputs: Vec<&ProjectorOutput> = project
+            .outputs
+            .iter()
+            .filter(|o| view.outputs.as_ref().is_none_or(|ids| ids.contains(&o.id)))
+            .collect();
+        let mut specs = HashMap::new();
+        if let Some(scene) = project.scenes.iter().find(|s| s.id == scene_id) {
+            for layer in &scene.layers {
+                if let Some(asset) = project.assets.iter().find(|a| a.id == layer.asset_id) {
+                    specs.insert(
+                        layer.id,
+                        LayerSpec::new(layer, asset, &outputs, view.max_side),
+                    );
+                }
+            }
+        }
+        specs
+    }
+
     /// Starts decoders for the scene's layers at show time `position` and
     /// stops the rest. Unchanged layers keep running unless `restart`.
     fn sync(&self, project: &ShowProject, scene_id: Uuid, restart: bool, position: f64) {
-        let wanted = layer_specs(project, scene_id);
+        let wanted = self.layer_specs(project, scene_id);
         // A scene restarting from the top can use media pre-rolled for it.
         let mut standby = match self.standby.lock().unwrap().take() {
             Some((id, at, slots)) if restart && id == scene_id && (at - position).abs() < 1e-6 => {
@@ -852,7 +1087,8 @@ impl MediaPool {
         if let Some((_, _, old)) = standby.take() {
             old.values().for_each(Slot::cancel);
         }
-        let slots = layer_specs(project, scene_id)
+        let slots = self
+            .layer_specs(project, scene_id)
             .into_iter()
             .map(|(id, spec)| (id, self.start_slot(spec, position)))
             .collect();
@@ -861,12 +1097,13 @@ impl MediaPool {
 
     fn start_slot(&self, spec: LayerSpec, position: f64) -> Slot {
         let start = spec.media_time(position);
-        let video = matches!(spec.asset.kind, AssetKind::Image | AssetKind::Video).then(|| {
+        let visual = matches!(spec.asset.kind, AssetKind::Image | AssetKind::Video);
+        let video = (visual && !spec.hidden).then(|| {
             let decoder = Arc::new(Decoder::default());
             let worker = decoder.clone();
             let worker_spec = spec.clone();
             thread::spawn(move || match worker_spec.asset.kind {
-                AssetKind::Image => worker.decode_image(&worker_spec.asset),
+                AssetKind::Image => worker.decode_image(&worker_spec),
                 _ => worker.decode_video(&worker_spec, start),
             });
             decoder
@@ -915,19 +1152,22 @@ impl MediaPool {
         }
     }
 
-    fn frames(&self) -> Vec<(Uuid, Option<DecodedFrame>)> {
+    /// Each picture layer's newest frame and which part of the media it is.
+    fn frames(&self) -> Vec<(Uuid, Option<DecodedFrame>, [f32; 4])> {
         self.slots
             .lock()
             .unwrap()
             .iter()
             .filter_map(|(id, slot)| {
                 let video = slot.video.as_ref()?;
-                Some((*id, video.latest.lock().unwrap().clone()))
+                Some((*id, video.latest.lock().unwrap().clone(), slot.spec.uv))
             })
             .collect()
     }
 
-    fn summary(&self) -> (usize, usize, Vec<String>) {
+    /// Picture and sound layer counts, errors, and what each picture layer
+    /// is decoding, for the Player window.
+    fn summary(&self) -> (usize, usize, Vec<String>, Vec<String>) {
         let slots = self.slots.lock().unwrap();
         let videos = slots.values().filter(|s| s.video.is_some()).count();
         let sounds = slots.values().filter(|s| s.audio.is_some()).count();
@@ -935,7 +1175,13 @@ impl MediaPool {
             .values()
             .filter_map(|s| s.video.as_ref()?.error.lock().unwrap().clone())
             .collect();
-        (videos, sounds, errors)
+        let mut infos: Vec<String> = slots
+            .values()
+            .filter_map(|s| s.video.as_ref()?.info.lock().unwrap().clone().into())
+            .filter(|info| !info.is_empty())
+            .collect();
+        infos.sort();
+        (videos, sounds, errors, infos)
     }
 }
 
@@ -1046,6 +1292,7 @@ fn apply(runtime: &mut Runtime, envelope: Envelope, media: &MediaPool) {
             player,
         } => match project.validate() {
             Ok(()) => {
+                media.set_view(outputs.clone(), runtime.settings.quality);
                 let current = runtime
                     .state
                     .scene_id
@@ -1205,7 +1452,15 @@ fn handle_protocol(mut stream: TcpStream, shared: Arc<Mutex<Runtime>>, media: Ar
             apply(&mut shared.lock().unwrap(), envelope, &media);
         }
     }
-    let state = shared.lock().unwrap().snapshot();
+    let state = {
+        let mut runtime = shared.lock().unwrap();
+        let mut state = runtime.snapshot();
+        if runtime.project_update_pending {
+            state.project_update = runtime.project.clone().map(Box::new);
+            runtime.project_update_pending = false;
+        }
+        state
+    };
     if let Ok(json) = serde_json::to_string(&state) {
         let _ = writeln!(stream, "{json}");
     }
@@ -1295,7 +1550,14 @@ fn controller_json(runtime: &Runtime) -> String {
             })
         })
         .collect();
-    serde_json::json!({ "settings": settings, "scenes": scenes }).to_string()
+    let current_scene = runtime.scene().map(|scene| {
+        serde_json::json!({
+            "id": scene.id,
+            "label": button_label(&scene.button.label, &scene.name),
+            "duration_seconds": scene.duration(),
+        })
+    });
+    serde_json::json!({ "settings": settings, "scenes": scenes, "current_scene": current_scene }).to_string()
 }
 
 fn http_server(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>, relay: Arc<Relay>) {
@@ -1317,6 +1579,11 @@ struct HttpRequest {
     content_length: u64,
     /// Body bytes that arrived together with the headers.
     body_start: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct ProjectorOrderRequest {
+    order: Vec<Uuid>,
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
@@ -1396,6 +1663,151 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
         ("GET", "/api/controller") => {
             let json = controller_json(&shared.lock().unwrap());
             http_response(stream, "200 OK", "application/json", &json);
+        }
+        ("GET", "/api/projectors") => {
+            let json = projector_positions_json(&shared.lock().unwrap());
+            http_response(stream, "200 OK", "application/json", &json);
+        }
+        ("POST", "/api/calibration") => {
+            if let Some(master) = shared.lock().unwrap().settings.master_http() {
+                match setup::forward_to_master(&master, "/api/calibration") {
+                    Ok(()) => http_response(stream, "204 No Content", "text/plain", ""),
+                    Err(e) => http_response(stream, "502 Bad Gateway", "text/plain", &e),
+                }
+                return;
+            }
+            let command = {
+                let mut runtime = shared.lock().unwrap();
+                let Some(project) = runtime.project.as_mut() else {
+                    http_response(stream, "409 Conflict", "text/plain", "No show is loaded");
+                    return;
+                };
+                project.test_pattern = if project.test_pattern == TestPattern::Identify {
+                    TestPattern::Off
+                } else {
+                    TestPattern::Identify
+                };
+                let updated = project.clone();
+                runtime.project_update_pending = true;
+                let outputs = runtime.outputs.clone();
+                let player = runtime.address.clone();
+                save_show(&updated, &outputs, &player);
+                Command::LoadProject { project: updated, outputs, player }
+            };
+            relay::control(shared, media, relay, command);
+            http_response(stream, "204 No Content", "text/plain", "");
+        }
+        ("POST", "/api/projector-order") => {
+            let mut body = Vec::new();
+            if let Err(e) = read_body(&mut stream, &request, |bytes| {
+                body.extend_from_slice(bytes);
+                Ok(())
+            }) {
+                http_response(stream, "400 Bad Request", "text/plain", &e.to_string());
+                return;
+            }
+            let request_order = match serde_json::from_slice::<ProjectorOrderRequest>(&body) {
+                Ok(order) => order.order,
+                Err(e) => {
+                    http_response(stream, "400 Bad Request", "text/plain", &e.to_string());
+                    return;
+                }
+            };
+            if let Some(master) = shared.lock().unwrap().settings.master_http() {
+                match setup::forward_to_master_json(&master, "/api/projector-order", &body) {
+                    Ok(()) => http_response(stream, "204 No Content", "text/plain", ""),
+                    Err(e) => http_response(stream, "502 Bad Gateway", "text/plain", &e),
+                }
+                return;
+            }
+            let result = {
+                let mut runtime = shared.lock().unwrap();
+                let outputs = runtime.outputs.clone();
+                let player = runtime.address.clone();
+                let Some(project) = runtime.project.as_mut() else {
+                    http_response(stream, "409 Conflict", "text/plain", "No show is loaded");
+                    return;
+                };
+                let ids: HashSet<Uuid> = request_order.iter().copied().collect();
+                if request_order.len() != project.outputs.len()
+                    || ids.len() != request_order.len()
+                    || project.outputs.iter().any(|output| !ids.contains(&output.id))
+                {
+                    Err("Order must contain every projector exactly once.".to_owned())
+                } else {
+                    let mut slots: Vec<(f32, f32)> = project.outputs.iter()
+                        .map(|output| (output.stage_x, output.stage_y)).collect();
+                    slots.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.total_cmp(&b.0)));
+                    for (id, (x, y)) in request_order.iter().zip(slots) {
+                        if let Some(output) = project.outputs.iter_mut().find(|output| output.id == *id) {
+                            output.stage_x = x;
+                            output.stage_y = y;
+                        }
+                    }
+                    project.auto_blend();
+                    let updated = project.clone();
+                    runtime.project_update_pending = true;
+                    save_show(&updated, &outputs, &player);
+                    Ok(Command::LoadProject { project: updated, outputs, player })
+                }
+            };
+            match result {
+                Ok(command) => {
+                    relay::control(shared, media, relay, command);
+                    http_response(stream, "204 No Content", "text/plain", "");
+                }
+                Err(message) => http_response(stream, "400 Bad Request", "text/plain", &message),
+            }
+        }
+        ("POST", "/api/swap-positions") => {
+            if let Some(master) = shared.lock().unwrap().settings.master_http() {
+                match setup::forward_to_master(&master, "/api/swap-positions") {
+                    Ok(()) => http_response(stream, "204 No Content", "text/plain", ""),
+                    Err(e) => http_response(stream, "502 Bad Gateway", "text/plain", &e),
+                }
+                return;
+            }
+            let result = {
+                let mut runtime = shared.lock().unwrap();
+                let outputs = runtime.outputs.clone();
+                let player = runtime.address.clone();
+                let Some(project) = runtime.project.as_mut() else {
+                    http_response(stream, "409 Conflict", "text/plain", "No show is loaded");
+                    return;
+                };
+                let mut local: Vec<usize> = (0..project.outputs.len()).collect();
+                local.sort_by(|a, b| {
+                    project.outputs[*a].stage_y.total_cmp(&project.outputs[*b].stage_y)
+                        .then_with(|| project.outputs[*a].stage_x.total_cmp(&project.outputs[*b].stage_x))
+                });
+                if local.len() < 2 {
+                    Err((
+                        "409 Conflict",
+                        "This Player needs at least two projectors to swap positions.".to_owned(),
+                    ))
+                } else {
+                    let (first_index, second_index) = (local[0], local[1]);
+                    let (left, right) = project.outputs.split_at_mut(second_index);
+                    std::mem::swap(&mut left[first_index].stage_x, &mut right[0].stage_x);
+                    std::mem::swap(&mut left[first_index].stage_y, &mut right[0].stage_y);
+                    project.auto_blend();
+                    let updated = project.clone();
+                    runtime.project_update_pending = true;
+                    save_show(&updated, &outputs, &player);
+                    Ok(Command::LoadProject {
+                        project: updated,
+                        outputs,
+                        player,
+                    })
+                }
+            };
+            match result {
+                Ok(command) => {
+                    relay::control(shared, media, relay, command);
+                    http_response(stream, "204 No Content", "text/plain", "");
+                }
+                Err((status, message)) => http_response(stream, status, "text/plain", &message),
+            }
         }
         ("GET", "/api/assets") => {
             let assets: Vec<Asset> = shared
@@ -1519,6 +1931,32 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
     }
 }
 
+fn projector_positions_json(runtime: &Runtime) -> String {
+    let Some(project) = &runtime.project else {
+        return serde_json::json!({ "outputs": [], "identifying": false }).to_string();
+    };
+    let mut ordered: Vec<_> = project.outputs.iter().enumerate().collect();
+    ordered.sort_by(|(ai, a), (bi, b)| {
+        a.stage_y.total_cmp(&b.stage_y)
+            .then_with(|| a.stage_x.total_cmp(&b.stage_x))
+            .then_with(|| ai.cmp(bi))
+    });
+    let outputs: Vec<_> = ordered.iter().enumerate().map(|(position, (index, output))| {
+        serde_json::json!({
+            "id": output.id,
+            "name": output.name,
+            "number": index + 1,
+            "position": position,
+            "x": output.stage_x,
+            "y": output.stage_y
+        })
+    }).collect();
+    serde_json::json!({
+        "outputs": outputs,
+        "identifying": project.test_pattern == TestPattern::Identify
+    }).to_string()
+}
+
 /// Sends one of the show's media files to a sub that is missing it.
 fn send_media(mut stream: TcpStream, path: &str, shared: &Mutex<Runtime>) {
     let asset = Uuid::parse_str(path.trim_start_matches("/api/media/"))
@@ -1620,7 +2058,7 @@ fn receive_media(
 struct PlayerApp {
     shared: Arc<Mutex<Runtime>>,
     media: Arc<MediaPool>,
-    textures: HashMap<Uuid, (egui::TextureHandle, u64)>,
+    textures: HashMap<Uuid, (egui::TextureHandle, u64, [f32; 4])>,
     show_outputs: bool,
     monitors: Vec<DisplayMonitor>,
     /// When the screens were last listed; projectors plugged in later appear.
@@ -1691,15 +2129,42 @@ fn plan_screens(
             None => {}
         }
     }
-    let mut free: Vec<&DisplayMonitor> = monitors
+    let automatic: Vec<&ProjectorOutput> = mine
+        .iter()
+        .copied()
+        .filter(|output| !plan.contains_key(&output.id))
+        .collect();
+    // Keep the primary screen free when there are enough secondary screens.
+    // If the show has more outputs, include the primary so every projector can
+    // fill a display. Screens are handed out left to right in projector-number
+    // order, never by stage position: a projector stays on its screen when it
+    // is moved on the canvas, so the picture on that screen changes, which is
+    // the whole point of moving it (or of ordering projectors on the iPad).
+    let extra_screens = monitors
         .iter()
         .filter(|m| !m.primary && !taken.contains(&m.index))
+        .count();
+    let include_primary = automatic.len() > extra_screens;
+    let mut free: Vec<&DisplayMonitor> = monitors
+        .iter()
+        .filter(|m| !taken.contains(&m.index) && (include_primary || !m.primary))
         .collect();
     free.sort_by_key(|m| (m.x, m.y));
-    let mut free = free.into_iter();
+    for (output, display) in automatic.into_iter().zip(free) {
+        plan.insert(
+            output.id,
+            Placement {
+                display: Some(display.index),
+                source: ScreenSource::Automatic,
+                missing: missing.get(&output.id).copied(),
+            },
+        );
+    }
+    // If there are more projectors than displays, keep the remaining outputs
+    // as movable preview windows instead of stacking fullscreen windows.
     for output in mine {
         plan.entry(output.id).or_insert_with(|| Placement {
-            display: free.next().map(|m| m.index),
+            display: None,
             source: ScreenSource::Automatic,
             missing: missing.get(&output.id).copied(),
         });
@@ -1709,9 +2174,9 @@ fn plan_screens(
 
 impl PlayerApp {
     /// Which screen each of this PC's projectors fills: the one chosen on this
-    /// PC, else the one set in Producer, else the next free extra screen from
-    /// left to right. The main screen is never filled automatically, so the
-    /// control windows stay visible. A chosen screen that isn't connected is
+    /// PC, else the one set in Producer, else a free screen matched to the
+    /// output's left-to-right position. The primary is kept free when enough
+    /// secondary screens exist. A chosen screen that isn't connected is
     /// replaced automatically.
     fn screen_plan(
         &self,
@@ -1748,6 +2213,20 @@ impl PlayerApp {
         };
         if let Err(e) = setup::save_settings(&runtime.settings) {
             runtime.state.message = format!("Could not save the screen choice: {e}");
+        }
+    }
+
+    /// Saves the chosen quality and restarts the playing media at it.
+    fn set_quality(&mut self, quality: setup::Quality) {
+        let mut runtime = self.shared.lock().unwrap();
+        runtime.settings.quality = quality;
+        if let Err(e) = setup::save_settings(&runtime.settings) {
+            runtime.state.message = format!("Could not save the quality setting: {e}");
+        }
+        self.media.set_quality(quality);
+        if let (Some(project), Some(scene_id)) = (&runtime.project, runtime.state.scene_id) {
+            self.media
+                .sync(project, scene_id, false, runtime.clock.position());
         }
     }
 
@@ -1829,32 +2308,31 @@ impl PlayerApp {
     fn update_textures(&mut self, ctx: &egui::Context) {
         let frames = self.media.frames();
         self.textures
-            .retain(|id, _| frames.iter().any(|(frame_id, _)| frame_id == id));
-        for (id, frame) in frames {
+            .retain(|id, _| frames.iter().any(|(frame_id, _, _)| frame_id == id));
+        for (id, frame, uv) in frames {
             let Some(frame) = frame else {
                 continue;
             };
             if self
                 .textures
                 .get(&id)
-                .is_some_and(|(_, sequence)| *sequence == frame.sequence)
+                .is_some_and(|(_, sequence, _)| *sequence == frame.sequence)
             {
                 continue;
             }
-            let image =
-                egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
             match self.textures.get_mut(&id) {
-                Some((texture, sequence)) => {
-                    texture.set(image, egui::TextureOptions::LINEAR);
+                Some((texture, sequence, part)) => {
+                    texture.set(frame.image.clone(), egui::TextureOptions::LINEAR);
                     *sequence = frame.sequence;
+                    *part = uv;
                 }
                 None => {
                     let texture = ctx.load_texture(
                         format!("media-{id}"),
-                        image,
+                        frame.image.clone(),
                         egui::TextureOptions::LINEAR,
                     );
-                    self.textures.insert(id, (texture, frame.sequence));
+                    self.textures.insert(id, (texture, frame.sequence, uv));
                 }
             }
         }
@@ -1870,6 +2348,8 @@ struct OutputMapping {
     output_height: f32,
     /// Unit-square to corrected output homography, row-major.
     homography: [f32; 9],
+    mode: WarpMode,
+    mesh: [[f32; 2]; 9],
 }
 
 impl OutputMapping {
@@ -1887,6 +2367,8 @@ impl OutputMapping {
             output_width: output.stage_width,
             output_height: output.stage_height,
             homography: square_to_quad(corners),
+            mode: output.warp_mode,
+            mesh: output.warp_mesh,
         }
     }
 
@@ -1898,6 +2380,32 @@ impl OutputMapping {
     }
 
     fn normalized(&self, u: f32, v: f32) -> egui::Pos2 {
+        if self.mode == WarpMode::None {
+            return egui::pos2(
+                self.rect.left() + u * self.rect.width(),
+                self.rect.top() + v * self.rect.height(),
+            );
+        }
+        if matches!(self.mode, WarpMode::Horizontal | WarpMode::Vertical | WarpMode::Full) {
+            let gx = (u.clamp(0.0, 1.0) * 2.0).min(1.999_999);
+            let gy = (v.clamp(0.0, 1.0) * 2.0).min(1.999_999);
+            let col = gx.floor() as usize;
+            let row = gy.floor() as usize;
+            let fx = gx - col as f32;
+            let fy = gy - row as f32;
+            let p00 = self.mesh[row * 3 + col];
+            let p10 = self.mesh[row * 3 + col + 1];
+            let p01 = self.mesh[(row + 1) * 3 + col];
+            let p11 = self.mesh[(row + 1) * 3 + col + 1];
+            let x0 = egui::lerp(p00[0]..=p10[0], fx);
+            let x1 = egui::lerp(p01[0]..=p11[0], fx);
+            let y0 = egui::lerp(p00[1]..=p10[1], fx);
+            let y1 = egui::lerp(p01[1]..=p11[1], fx);
+            return egui::pos2(
+                self.rect.left() + egui::lerp(x0..=x1, fy) * self.rect.width(),
+                self.rect.top() + egui::lerp(y0..=y1, fy) * self.rect.height(),
+            );
+        }
         let h = self.homography;
         let w = h[6] * u + h[7] * v + h[8];
         egui::pos2(
@@ -1951,7 +2459,7 @@ fn paint_output(
     project: &ShowProject,
     state: &PlayerState,
     output: &ProjectorOutput,
-    textures: &HashMap<Uuid, (egui::TextureHandle, u64)>,
+    textures: &HashMap<Uuid, (egui::TextureHandle, u64, [f32; 4])>,
 ) {
     let rect = ui.max_rect();
     let painter = ui.painter_at(rect);
@@ -1984,16 +2492,23 @@ fn paint_output(
 }
 
 fn paint_warped_color(painter: &egui::Painter, map: &OutputMapping, color: egui::Color32) {
+    const SUBDIVISIONS: usize = 24;
     let mut mesh = egui::Mesh::default();
-    for point in [
-        map.normalized(0.0, 0.0),
-        map.normalized(1.0, 0.0),
-        map.normalized(1.0, 1.0),
-        map.normalized(0.0, 1.0),
-    ] {
-        mesh.colored_vertex(point, color);
+    for y in 0..=SUBDIVISIONS {
+        for x in 0..=SUBDIVISIONS {
+            mesh.colored_vertex(
+                map.normalized(x as f32 / SUBDIVISIONS as f32, y as f32 / SUBDIVISIONS as f32),
+                color,
+            );
+        }
     }
-    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    let row = (SUBDIVISIONS + 1) as u32;
+    for y in 0..SUBDIVISIONS as u32 {
+        for x in 0..SUBDIVISIONS as u32 {
+            let a = y * row + x;
+            mesh.indices.extend_from_slice(&[a, a + 1, a + row + 1, a, a + row + 1, a + row]);
+        }
+    }
     painter.add(mesh);
 }
 
@@ -2003,7 +2518,7 @@ fn paint_layers(
     project: &ShowProject,
     state: &PlayerState,
     output: &ProjectorOutput,
-    textures: &HashMap<Uuid, (egui::TextureHandle, u64)>,
+    textures: &HashMap<Uuid, (egui::TextureHandle, u64, [f32; 4])>,
 ) {
     let Some(scene) = state
         .scene_id
@@ -2033,15 +2548,18 @@ fn paint_layers(
             continue;
         }
         // Until the first frame arrives the area stays black.
-        if let Some((texture, _)) = textures.get(&layer.id) {
+        if let Some((texture, _, part)) = textures.get(&layer.id) {
+            // The texture holds only the part of the media this PC shows
+            // (`part`, in whole-media coordinates), so map through it.
+            let within = |v: f32, lo: f32, hi: f32| (v - lo) / (hi - lo).max(1e-6);
             let uv = egui::Rect::from_min_max(
                 egui::pos2(
-                    (left - layer.x) / layer.width,
-                    (top - layer.y) / layer.height,
+                    within((left - layer.x) / layer.width, part[0], part[2]),
+                    within((top - layer.y) / layer.height, part[1], part[3]),
                 ),
                 egui::pos2(
-                    (right - layer.x) / layer.width,
-                    (bottom - layer.y) / layer.height,
+                    within((right - layer.x) / layer.width, part[0], part[2]),
+                    within((bottom - layer.y) / layer.height, part[1], part[3]),
                 ),
             );
             paint_warped_image(
@@ -2204,11 +2722,13 @@ fn paint_grid(
     let rows = 9;
     for i in 0..=columns {
         let x = stage.width * i as f32 / columns as f32;
-        painter.line_segment([map.point(x, 0.0), map.point(x, stage.height)], stroke);
+        let points: Vec<_> = (0..=48).map(|step| map.point(x, stage.height * step as f32 / 48.0)).collect();
+        painter.add(egui::Shape::line(points, stroke));
     }
     for i in 0..=rows {
         let y = stage.height * i as f32 / rows as f32;
-        painter.line_segment([map.point(0.0, y), map.point(stage.width, y)], stroke);
+        let points: Vec<_> = (0..=48).map(|step| map.point(stage.width * step as f32 / 48.0, y)).collect();
+        painter.add(egui::Shape::line(points, stroke));
     }
     let circle: Vec<_> = (0..=96)
         .map(|step| {
@@ -2417,13 +2937,39 @@ impl eframe::App for PlayerApp {
                     ui.checkbox(&mut runtime.state.blackout, "Blackout");
                 });
             }
-            let (videos, sounds, errors) = self.media.summary();
+            let (videos, sounds, errors, decodes) = self.media.summary();
             for error in errors {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
             ui.label(format!(
                 "{videos} picture layer(s) · {sounds} sound layer(s)"
             ));
+            for decode in decodes {
+                ui.small(decode);
+            }
+            ui.horizontal(|ui| {
+                ui.label("Video quality");
+                let mut quality = settings.quality;
+                egui::ComboBox::from_id_salt("video-quality")
+                    .selected_text(quality.label())
+                    .show_ui(ui, |ui| {
+                        for choice in setup::Quality::ALL {
+                            ui.selectable_value(&mut quality, choice, choice.label());
+                        }
+                    });
+                if quality != settings.quality {
+                    self.set_quality(quality);
+                }
+                ui.label(format!(
+                    "(this GPU shows pictures up to {} px)",
+                    texture_limit()
+                ))
+                .on_hover_text(
+                    "Each PC decodes only the part of the picture its projectors show, \
+                     at the media's own resolution. Lower the quality only if playback \
+                     stutters on this PC.",
+                );
+            });
             if self.media.audio_output.is_none() {
                 ui.colored_label(egui::Color32::YELLOW, "No audio output device found");
             }
@@ -2656,10 +3202,15 @@ fn main() -> eframe::Result<()> {
         local_ips: setup::local_ip().into_iter().collect(),
         ..Runtime::default()
     }));
+    let quality = shared.lock().unwrap().settings.quality;
     let media = Arc::new(MediaPool {
         slots: Mutex::new(HashMap::new()),
         standby: Mutex::new(None),
         audio_output: open_audio_output(),
+        view: Mutex::new(DecodeView {
+            outputs: None,
+            max_side: quality.max_side(),
+        }),
     });
     {
         let s = shared.clone();
@@ -2705,6 +3256,14 @@ fn main() -> eframe::Result<()> {
         "MapForge Player",
         eframe::NativeOptions::default(),
         Box::new(|cc| {
+            // Media is decoded at the largest size this GPU can show.
+            if let Some(gl) = &cc.gl {
+                use eframe::glow::HasContext;
+                let side = unsafe { gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE) };
+                if side >= 2048 {
+                    TEXTURE_LIMIT.store(side as u32, Ordering::Relaxed);
+                }
+            }
             let ctx = cc.egui_ctx.clone();
             let updater = mapforge_core::update::Updater::start(move || ctx.request_repaint());
             Ok(Box::new(PlayerApp {
@@ -2720,6 +3279,125 @@ fn main() -> eframe::Result<()> {
             }))
         }),
     )
+}
+
+#[cfg(test)]
+mod decode_size_tests {
+    use super::fit_within;
+
+    #[test]
+    fn media_that_fits_keeps_its_own_size() {
+        assert_eq!(fit_within(3840, 2160, 8192), (3840, 2160));
+        assert_eq!(fit_within(7680, 1080, 8192), (7680, 1080));
+        assert_eq!(fit_within(1080, 1920, 8192), (1080, 1920));
+    }
+
+    #[test]
+    fn oversized_media_shrinks_to_the_limit_keeping_its_shape() {
+        assert_eq!(fit_within(11520, 1080, 8192), (8192, 768));
+        assert_eq!(fit_within(1080, 11520, 8192), (768, 8192));
+        assert_eq!(fit_within(16000, 16000, 4096), (4096, 4096));
+    }
+
+    #[test]
+    fn sizes_are_even_and_never_zero() {
+        assert_eq!(fit_within(1919, 1079, 8192), (1920, 1080));
+        assert_eq!(fit_within(1, 1, 8192), (2, 2));
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    /// A 10600×1080 panorama laid over a 10400 px stage, like a travelling
+    /// show, with two 1920 px projectors at the left end.
+    fn panorama() -> (ShowProject, Layer, Asset) {
+        let mut project = ShowProject::default();
+        project.outputs[0].stage_x = 0.0;
+        project.outputs[1].stage_x = 1766.0;
+        project.lock_output_sizes();
+        let asset = Asset {
+            id: Uuid::new_v4(),
+            path: "pan.mov".into(),
+            name: "pan.mov".into(),
+            kind: AssetKind::Video,
+            checksum_sha256: String::new(),
+            width: Some(10600),
+            height: Some(1080),
+            duration_seconds: Some(60.0),
+            size_bytes: None,
+        };
+        let layer = Layer {
+            id: Uuid::new_v4(),
+            asset_id: asset.id,
+            name: "pan".into(),
+            x: -100.0,
+            y: 0.0,
+            width: 10600.0,
+            height: 1080.0,
+            opacity: 1.0,
+            output_ids: project.outputs.iter().map(|o| o.id).collect(),
+            timeline_start: 0.0,
+            timeline_duration: 60.0,
+            source_offset: 0.0,
+            looping: true,
+            volume: 1.0,
+            audio: true,
+        };
+        (project, layer, asset)
+    }
+
+    #[test]
+    fn only_the_shown_part_of_a_panorama_is_decoded() {
+        let (project, layer, asset) = panorama();
+        let outputs: Vec<&ProjectorOutput> = project.outputs.iter().collect();
+        let spec = LayerSpec::new(&layer, &asset, &outputs, u32::MAX);
+        let [x, y, w, h] = spec.crop.expect("a slice of the panorama");
+        // Stage 0..3686 is media pixels 100..3786, plus a small margin.
+        assert_eq!((y, h), (0, 1080));
+        assert!(x <= 100 && x >= 90, "x = {x}");
+        assert!(x + w >= 3786 && x + w <= 3800, "right = {}", x + w);
+        assert_eq!((x % 2, w % 2), (0, 0));
+        assert!(!spec.hidden);
+        assert!((spec.uv[0] - x as f32 / 10600.0).abs() < 1e-6);
+        assert!((spec.uv[2] - (x + w) as f32 / 10600.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_pc_whose_projectors_do_not_show_a_layer_skips_its_picture() {
+        let (project, mut layer, asset) = panorama();
+        layer.output_ids.clear();
+        let outputs: Vec<&ProjectorOutput> = project.outputs.iter().collect();
+        let spec = LayerSpec::new(&layer, &asset, &outputs, u32::MAX);
+        assert!(spec.hidden);
+        assert_eq!(spec.crop, None);
+    }
+
+    #[test]
+    fn a_layer_inside_the_projectors_is_decoded_whole() {
+        let (project, mut layer, asset) = panorama();
+        layer.x = 200.0;
+        layer.width = 1000.0;
+        layer.height = 500.0;
+        let outputs: Vec<&ProjectorOutput> = project.outputs.iter().collect();
+        let spec = LayerSpec::new(&layer, &asset, &outputs, u32::MAX);
+        assert_eq!(spec.crop, None);
+        assert_eq!(spec.uv, [0.0, 0.0, 1.0, 1.0]);
+        assert!(!spec.hidden);
+    }
+
+    #[test]
+    fn the_quality_setting_caps_the_decode_size() {
+        let (project, layer, asset) = panorama();
+        let outputs: Vec<&ProjectorOutput> = project.outputs.iter().collect();
+        let spec = LayerSpec::new(&layer, &asset, &outputs, setup::Quality::Hd.max_side());
+        assert_eq!(spec.max_side, 1920);
+        let [_, _, w, h] = spec.crop.unwrap();
+        let (dw, dh) = fit_within(w, h, spec.max_side);
+        assert_eq!(dw, 1920);
+        assert!(dh < 1080 && dh % 2 == 0);
+    }
 }
 
 #[cfg(test)]
@@ -2741,6 +3419,12 @@ mod output_mapping_tests {
             output_width: 1.0,
             output_height: 1.0,
             homography: square_to_quad(target),
+            mode: WarpMode::Perspective,
+            mesh: [
+                [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+                [0.0, 1.0], [0.5, 1.0], [1.0, 1.0],
+            ],
         };
         for ((u, v), expected) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
             .into_iter()
@@ -2753,14 +3437,62 @@ mod output_mapping_tests {
     }
 
     #[test]
+    fn horizontal_mesh_moves_middle_row_and_keeps_edges() {
+        let mut output = ShowProject::default().outputs.remove(0);
+        output.warp_mode = WarpMode::Horizontal;
+        output.warp_mesh[4][1] = 0.6;
+        let map = OutputMapping::new(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)),
+            &output,
+        );
+        let center = map.normalized(0.5, 0.5);
+        assert!((center.x - 50.0).abs() < 0.001);
+        assert!((center.y - 60.0).abs() < 0.001);
+        let tl = map.normalized(0.0, 0.0);
+        let br = map.normalized(1.0, 1.0);
+        assert!(tl.distance(egui::pos2(0.0, 0.0)) < 0.001);
+        assert!(br.distance(egui::pos2(100.0, 100.0)) < 0.001);
+    }
+
+    #[test]
+    fn vertical_mesh_moves_middle_column_and_keeps_edges() {
+        let mut output = ShowProject::default().outputs.remove(0);
+        output.warp_mode = WarpMode::Vertical;
+        output.warp_mesh[4][0] = 0.6;
+        let map = OutputMapping::new(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)),
+            &output,
+        );
+        let center = map.normalized(0.5, 0.5);
+        assert!((center.x - 60.0).abs() < 0.001);
+        assert!((center.y - 50.0).abs() < 0.001);
+        let tl = map.normalized(0.0, 0.0);
+        let br = map.normalized(1.0, 1.0);
+        assert!(tl.distance(egui::pos2(0.0, 0.0)) < 0.001);
+        assert!(br.distance(egui::pos2(100.0, 100.0)) < 0.001);
+    }
+
+    #[test]
+    fn full_mesh_applies_an_interior_point_and_none_bypasses_warp() {
+        let mut output = ShowProject::default().outputs.remove(0);
+        output.warp_mode = WarpMode::Full;
+        output.warp_mesh[4] = [0.6, 0.6];
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
+        let full = OutputMapping::new(rect, &output);
+        assert!(full.normalized(0.5, 0.5).distance(egui::pos2(60.0, 60.0)) < 0.001);
+
+        output.warp_mode = WarpMode::None;
+        output.warp_corners = [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]];
+        let none = OutputMapping::new(rect, &output);
+        assert!(none.normalized(0.0, 0.0).distance(egui::pos2(0.0, 0.0)) < 0.001);
+        assert!(none.normalized(1.0, 1.0).distance(egui::pos2(100.0, 100.0)) < 0.001);
+    }
+
+    #[test]
     fn scheduled_start_compensates_for_lateness() {
         let project = ShowProject::default();
         let scene_id = project.scenes[0].id;
-        let media = MediaPool {
-            slots: Mutex::new(HashMap::new()),
-            standby: Mutex::new(None),
-            audio_output: None,
-        };
+        let media = MediaPool::default();
         let mut runtime = Runtime {
             project: Some(project),
             ..Default::default()
@@ -2808,9 +3540,32 @@ mod screen_plan_tests {
         assert_eq!(plan[&b].display, Some(2));
         assert!(plan[&a].source == ScreenSource::Automatic);
 
-        // Only the main screen: both stay windows.
+        // With no extra screen, the first output fills the primary and the
+        // second remains a movable preview window.
         let plan = plan_screens(&monitors[..1], &project, &None, &HashMap::new());
-        assert_eq!(plan[&a].display, None);
+        assert_eq!(plan[&a].display, Some(0));
+        assert_eq!(plan[&b].display, None);
+    }
+
+    #[test]
+    fn moving_a_projector_on_the_canvas_keeps_it_on_its_screen() {
+        let mut project = ShowProject::default(); // two projectors, side by side
+        let [a, b] = [project.outputs[0].id, project.outputs[1].id];
+        let monitors = [
+            screen(0, 0, true),
+            screen(1, 1920, false),
+            screen(2, 3840, false),
+        ];
+        let before = plan_screens(&monitors, &project, &None, &HashMap::new());
+        // Swap the two projectors' places on the stage, as the iPad's projector
+        // order or a drag in Producer does.
+        let (x0, x1) = (project.outputs[0].stage_x, project.outputs[1].stage_x);
+        project.outputs[0].stage_x = x1;
+        project.outputs[1].stage_x = x0;
+        let after = plan_screens(&monitors, &project, &None, &HashMap::new());
+        // Same screens, so each screen now shows the other part of the canvas.
+        assert_eq!(after[&a].display, before[&a].display);
+        assert_eq!(after[&b].display, before[&b].display);
     }
 
     #[test]

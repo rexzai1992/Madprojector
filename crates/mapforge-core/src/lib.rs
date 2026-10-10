@@ -315,6 +315,12 @@ pub struct ProjectorOutput {
     /// bottom-right and bottom-left, normalized to the projector window.
     #[serde(default = "default_warp_corners")]
     pub warp_corners: [[f32; 2]; 4],
+    /// Geometry correction mode. Older shows default to perspective corner pinning.
+    #[serde(default)]
+    pub warp_mode: WarpMode,
+    /// 3×3 normalized correction grid (row-major), used by curved/full modes.
+    #[serde(default = "default_warp_mesh")]
+    pub warp_mesh: [[f32; 2]; 9],
     /// Optional hard-edged polygon mask in normalized projector coordinates.
     #[serde(default)]
     pub mask: OutputMask,
@@ -334,6 +340,25 @@ fn default_resolution() -> [u32; 2] {
 
 fn default_warp_corners() -> [[f32; 2]; 4] {
     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+}
+
+fn default_warp_mesh() -> [[f32; 2]; 9] {
+    [
+        [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+        [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+        [0.0, 1.0], [0.5, 1.0], [1.0, 1.0],
+    ]
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarpMode {
+    None,
+    #[default]
+    Perspective,
+    Horizontal,
+    Vertical,
+    Full,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -496,6 +521,8 @@ impl Default for ShowProject {
             resolution: [1920, 1080],
             display_index: None,
             warp_corners: default_warp_corners(),
+            warp_mode: WarpMode::default(),
+            warp_mesh: default_warp_mesh(),
             mask: OutputMask::default(),
             stage_x: 0.0,
             stage_y: 0.0,
@@ -514,6 +541,8 @@ impl Default for ShowProject {
             resolution: [1920, 1080],
             display_index: None,
             warp_corners: default_warp_corners(),
+            warp_mode: WarpMode::default(),
+            warp_mesh: default_warp_mesh(),
             mask: OutputMask::default(),
             stage_x: 900.0,
             stage_y: 0.0,
@@ -613,6 +642,14 @@ impl ShowProject {
                 .any(|value| !value.is_finite() || !(-0.5..=1.5).contains(value))
             {
                 bail!("output warp corners are out of range");
+            }
+            if output
+                .warp_mesh
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite() || !(-0.5..=1.5).contains(value))
+            {
+                bail!("output warp mesh points are out of range");
             }
             if output.mask.enabled
                 && (output.mask.points.len() < 3
@@ -728,7 +765,8 @@ pub fn load_project(path: &Path) -> Result<ShowProject> {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
+    let mut file = std::io::BufReader::with_capacity(1024 * 1024, file);
     let mut hash = Sha256::new();
     std::io::copy(&mut file, &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
@@ -834,6 +872,9 @@ pub struct PlayerState {
     /// Screens connected to this Player PC, for choosing projector displays.
     #[serde(default)]
     pub displays: Vec<DisplayInfo>,
+    /// One-shot show update initiated from Player's web controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_update: Option<Box<ShowProject>>,
     pub message: String,
 }
 
@@ -884,6 +925,7 @@ impl Default for PlayerState {
             role: None,
             autoplay: false,
             displays: Vec::new(),
+            project_update: None,
             message: "Waiting for Producer".into(),
         }
     }
@@ -955,6 +997,8 @@ mod tests {
             output.as_object_mut().unwrap().remove("color");
             output.as_object_mut().unwrap().remove("display_index");
             output.as_object_mut().unwrap().remove("warp_corners");
+            output.as_object_mut().unwrap().remove("warp_mode");
+            output.as_object_mut().unwrap().remove("warp_mesh");
             output.as_object_mut().unwrap().remove("mask");
             output["blend"].as_object_mut().unwrap().remove("luminance");
         }
@@ -964,6 +1008,8 @@ mod tests {
         assert_eq!(project.outputs[0].color.brightness, 1.0);
         assert_eq!(project.outputs[0].display_index, None);
         assert_eq!(project.outputs[0].warp_corners, default_warp_corners());
+        assert_eq!(project.outputs[0].warp_mode, WarpMode::Perspective);
+        assert_eq!(project.outputs[0].warp_mesh, default_warp_mesh());
         assert!(!project.outputs[0].mask.enabled);
     }
 
@@ -1031,6 +1077,15 @@ mod tests {
         let mut project = ShowProject::default();
         project.outputs[0].mask.enabled = true;
         project.outputs[0].mask.points = vec![[0.0, 0.0], [1.0, 0.0]];
+        assert!(project.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_or_out_of_range_warp_mesh_points() {
+        let mut project = ShowProject::default();
+        project.outputs[0].warp_mesh[4][0] = f32::NAN;
+        assert!(project.validate().is_err());
+        project.outputs[0].warp_mesh[4][0] = 1.6;
         assert!(project.validate().is_err());
     }
 }

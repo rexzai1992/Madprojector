@@ -31,6 +31,40 @@ pub struct PlayerSettings {
     /// projector → display, or `None` to keep it a window. These win over the
     /// display set in Producer.
     pub displays: HashMap<Uuid, Option<u32>>,
+    /// How large video and pictures are decoded on this PC.
+    pub quality: Quality,
+}
+
+/// The largest size media is decoded at on this PC. Full resolution is the
+/// default; the lower settings are for a PC that cannot keep up.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    #[default]
+    Full,
+    Uhd,
+    Hd,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 3] = [Quality::Full, Quality::Uhd, Quality::Hd];
+
+    /// The longest side media may have after decoding.
+    pub fn max_side(self) -> u32 {
+        match self {
+            Quality::Full => u32::MAX,
+            Quality::Uhd => 3840,
+            Quality::Hd => 1920,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Full => "Full resolution",
+            Quality::Uhd => "Up to 3840 px",
+            Quality::Hd => "Up to 1920 px (slow PC)",
+        }
+    }
 }
 
 impl PlayerSettings {
@@ -280,13 +314,24 @@ fn http_get(http: &str, path: &str) -> Result<(u64, BufReader<TcpStream>), Strin
 /// Passes an iPad button press on a sub to the master, so the iPad works
 /// from any PC and every PC stays together.
 pub fn forward_to_master(http: &str, path: &str) -> Result<(), String> {
+    forward_body_to_master(http, path, &[])
+}
+
+/// Passes a JSON controller action and its body on to the master Player.
+pub fn forward_to_master_json(http: &str, path: &str, body: &[u8]) -> Result<(), String> {
+    forward_body_to_master(http, path, body)
+}
+
+fn forward_body_to_master(http: &str, path: &str, body: &[u8]) -> Result<(), String> {
     let mut stream = connect(http, Duration::from_secs(2))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: {http}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: {http}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     )
     .map_err(|e| e.to_string())?;
+    stream.write_all(body).map_err(|e| e.to_string())?;
     let mut status = String::new();
     BufReader::new(stream)
         .read_line(&mut status)

@@ -24,6 +24,11 @@ fn version_numbers(version: &str) -> Vec<u64> {
     version
         .trim()
         .trim_start_matches('v')
+        // Ignore SemVer build metadata (for example, `0.1.8+local`) when
+        // deciding whether a published release is newer.
+        .split(['+', '-'])
+        .next()
+        .unwrap_or_default()
         .split('.')
         .map(|part| part.parse().unwrap_or(0))
         .collect()
@@ -365,6 +370,8 @@ mod tests {
     fn compares_versions_by_number() {
         assert!(is_newer("0.1.10", "0.1.9"));
         assert!(is_newer("v0.2.0", "0.1.99"));
+        assert!(!is_newer("0.1.8", "0.1.8+local"));
+        assert!(is_newer("0.1.9", "0.1.8+local"));
         assert!(!is_newer("0.1.5", "0.1.5"));
         assert!(!is_newer("0.1.4", "0.1.5"));
     }

@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, RichText};
 use mapforge_core::{
     load_project, save_project_atomic, scene_hotkey, sha256_file, tool_command, Asset, AssetKind,
     Command, Cue, DisplayInfo, EdgeBlend, EndAction, Layer, LoopRegion, OutputColor, PlayerRole,
-    PlayerState, ProjectorOutput, Scene, SceneButton, ShowProject, TestPattern, Transport,
+    PlayerState, ProjectorOutput, Scene, SceneButton, ShowProject, TestPattern, Transport, WarpMode,
 };
 use network::{unix_time_ms, PlayerLink};
 use std::{
@@ -204,6 +204,9 @@ struct ProducerApp {
     player: Option<PlayerState>,
     last_player_position: f64,
     thumbs: Thumbnails,
+    import_tx: Sender<ImportResult>,
+    import_rx: Receiver<ImportResult>,
+    pending_imports: HashSet<PathBuf>,
     status: String,
     playhead_seconds: f64,
     timeline_scale: f32,
@@ -248,10 +251,20 @@ struct NewProjector {
     expand_stage: bool,
 }
 
+struct ImportResult {
+    path: PathBuf,
+    project_id: Uuid,
+    scene_id: Uuid,
+    start: f64,
+    track: Option<usize>,
+    result: Result<Asset, String>,
+}
+
 impl ProducerApp {
     fn new(cc: &eframe::CreationContext) -> Self {
         apply_theme(&cc.egui_ctx);
         let project = ShowProject::default();
+        let (import_tx, import_rx) = mpsc::channel();
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
             last_saved: project.clone(),
@@ -276,6 +289,9 @@ impl ProducerApp {
             player: None,
             last_player_position: -1.0,
             thumbs: Thumbnails::new(),
+            import_tx,
+            import_rx,
+            pending_imports: HashSet::new(),
             status: "Welcome — drop images, videos or music on the timeline".into(),
             playhead_seconds: 0.0,
             timeline_scale: 55.0,
@@ -287,7 +303,9 @@ impl ProducerApp {
             show_controller: false,
             capture: None,
             new_projector: None,
-            layout_count: 6,
+            // A blank show should not invent a multi-projector installation.
+            // The layout tool can add the projector count the user needs.
+            layout_count: 1,
             timeline_zone: None,
             window_title: String::new(),
         };
@@ -339,6 +357,7 @@ impl ProducerApp {
             .sort_by_key(|l| wanted.iter().position(|a| a == &l.address));
 
         let mut online_states = Vec::new();
+        let mut controller_updates = Vec::new();
         for link in &mut self.links {
             let (online, state, reply, sync_failed) = {
                 let mut status = link.status.lock().unwrap();
@@ -359,8 +378,14 @@ impl ProducerApp {
                 self.status = reply;
             }
             if let Some(state) = state.filter(|_| online) {
+                if let Some(update) = state.project_update.as_deref() {
+                    controller_updates.push(update.clone());
+                }
                 online_states.push(state);
             }
+        }
+        for update in controller_updates {
+            self.apply_player_project_update(update);
         }
         self.online = !online_states.is_empty();
         // Prefer a Player that has a scene loaded for the transport display.
@@ -369,6 +394,46 @@ impl ProducerApp {
             .find(|s| s.scene_id.is_some())
             .or(online_states.first())
             .cloned();
+    }
+
+    /// Merges projector-only edits made from Player's web controller without
+    /// replacing unrelated unsaved edits in the Producer.
+    fn apply_player_project_update(&mut self, remote: ShowProject) {
+        if remote.id != self.project.id {
+            return;
+        }
+        let was_dirty = self.dirty();
+        let mut updated = self.project.clone();
+        for output in &mut updated.outputs {
+            if let Some(from_player) = remote.outputs.iter().find(|o| o.id == output.id) {
+                output.stage_x = from_player.stage_x;
+                output.stage_y = from_player.stage_y;
+                output.blend = from_player.blend.clone();
+            }
+        }
+        updated.test_pattern = remote.test_pattern;
+        if updated == self.project {
+            return;
+        }
+        self.project = updated;
+        if !was_dirty {
+            if let Some(path) = self.project_path.clone() {
+                match save_project_atomic(&self.project, &path) {
+                    Ok(()) => {
+                        self.last_saved = self.project.clone();
+                        self.history.reset(&self.project);
+                        self.status = format!("Saved projector calibration to {}", path.display());
+                    }
+                    Err(error) => {
+                        self.status = format!("Projector positions changed in Player; save failed: {error}");
+                    }
+                }
+            } else {
+                self.status = "Projector positions changed from the controller; save the show to keep them".into();
+            }
+        } else {
+            self.status = "Controller projector changes applied; save the show to keep them".into();
+        }
     }
 
     fn broadcast(&self, command: Command) {
@@ -656,14 +721,14 @@ impl ProducerApp {
         {
             let at = self.playhead_seconds;
             for path in paths {
-                self.import_path(&path, at, None);
+                self.begin_import(path, at, None);
             }
         }
     }
 
     /// Imports a file and places it on the timeline at `start` seconds, on a
     /// new track above layer index `track` (top of the scene when `None`).
-    fn import_path(&mut self, path: &Path, start: f64, track: Option<usize>) {
+    fn begin_import(&mut self, path: PathBuf, start: f64, track: Option<usize>) {
         let ext = path
             .extension()
             .and_then(|v| v.to_str())
@@ -689,45 +754,45 @@ impl ProducerApp {
             .iter()
             .find(|a| Path::new(&a.path) == path)
             .map(|a| a.id);
-        let asset_id = match existing {
-            Some(id) => id,
-            None => {
-                let (width, height, duration_seconds) = match kind {
-                    AssetKind::Image => match image::image_dimensions(path) {
-                        Ok((w, h)) => (Some(w), Some(h), None),
-                        Err(_) => (None, None, None),
-                    },
-                    _ => probe_media(path),
-                };
-                let checksum_sha256 = match sha256_file(path) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.status = format!("Import failed: {e}");
-                        return;
-                    }
-                };
-                let asset = Asset {
-                    id: Uuid::new_v4(),
-                    path: path.to_string_lossy().to_string(),
-                    name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    kind,
-                    checksum_sha256,
-                    width,
-                    height,
-                    duration_seconds,
-                    size_bytes: std::fs::metadata(path).ok().map(|m| m.len()),
-                };
-                let id = asset.id;
-                self.project.assets.push(asset);
-                id
+        if let Some(id) = existing {
+            let scene_id = self.scene().id;
+            self.add_layer_to_scene_at(id, scene_id, start, track);
+            self.status = format!("Added {}", path.display());
+            return;
+        }
+        if !self.pending_imports.insert(path.clone()) {
+            self.status = format!("Already importing {}", path.display());
+            return;
+        }
+        let project_id = self.project.id;
+        let scene_id = self.scene().id;
+        let tx = self.import_tx.clone();
+        let ctx = self.ctx.clone();
+        self.status = format!("Analyzing {} in the background…", path.display());
+        thread::spawn(move || {
+            let result = inspect_media(&path, kind);
+            let _ = tx.send(ImportResult { path, project_id, scene_id, start, track, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn finish_imports(&mut self) {
+        while let Ok(result) = self.import_rx.try_recv() {
+            self.pending_imports.remove(&result.path);
+            if result.project_id != self.project.id { continue; }
+            match result.result {
+                Ok(asset) => {
+                    let id = self.project.assets.iter().find(|a| a.path == asset.path).map(|a| a.id).unwrap_or_else(|| {
+                        let id = asset.id;
+                        self.project.assets.push(asset);
+                        id
+                    });
+                    self.add_layer_to_scene_at(id, result.scene_id, result.start, result.track);
+                    self.status = format!("Added {}", result.path.display());
+                }
+                Err(error) => self.status = format!("Import failed: {error}"),
             }
-        };
-        self.add_layer_at(asset_id, start, track);
-        self.status = format!("Added {}", path.display());
+        }
     }
 
     /// Adds a layer for an asset to the current scene at the playhead.
@@ -736,6 +801,12 @@ impl ProducerApp {
     }
 
     fn add_layer_at(&mut self, asset_id: Uuid, start: f64, track: Option<usize>) {
+        let scene_id = self.scene().id;
+        self.add_layer_to_scene_at(asset_id, scene_id, start, track);
+    }
+
+    fn add_layer_to_scene_at(&mut self, asset_id: Uuid, scene_id: Uuid, start: f64, track: Option<usize>) {
+        let Some(scene_index) = self.project.scenes.iter().position(|s| s.id == scene_id) else { return; };
         let Some(asset) = self.asset(asset_id) else {
             return;
         };
@@ -772,11 +843,11 @@ impl ProducerApp {
             volume: 1.0,
             audio: true,
         };
-        self.selected_layer = Some(layer.id);
-        if visual {
-            self.mode = EditMode::Layers;
+        if self.scene == scene_index {
+            self.selected_layer = Some(layer.id);
+            if visual { self.mode = EditMode::Layers; }
         }
-        let layers = &mut self.project.scenes[self.scene].layers;
+        let layers = &mut self.project.scenes[scene_index].layers;
         let index = track.map_or(layers.len(), |t| (t + 1).min(layers.len()));
         layers.insert(index, layer);
     }
@@ -1001,6 +1072,12 @@ impl ProducerApp {
             resolution: [spec.width, spec.height],
             display_index: None,
             warp_corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            warp_mode: WarpMode::Perspective,
+            warp_mesh: [
+                [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+                [0.0, 1.0], [0.5, 1.0], [1.0, 1.0],
+            ],
             mask: mapforge_core::OutputMask::default(),
             stage_x: x.max(0.0),
             stage_y: y,
@@ -1051,10 +1128,6 @@ impl ProducerApp {
     }
 
     fn remove_output(&mut self, id: Uuid) {
-        if self.project.outputs.len() <= 1 {
-            self.status = "A show needs at least one projector".into();
-            return;
-        }
         self.project.outputs.retain(|o| o.id != id);
         for scene in &mut self.project.scenes {
             for layer in &mut scene.layers {
@@ -1124,13 +1197,13 @@ impl ProducerApp {
         );
     }
 
-    /// New shows start on the 10400 × 1080 canvas with six 1920 × 1080
-    /// projectors overlapping by 224 px.
+    /// Start blank shows with a single-display canvas and no projector
+    /// outputs. Projectors are added explicitly from the Projectors panel.
     fn apply_default_canvas(&mut self) {
-        self.project.stage.width = 10400.0;
+        self.project.stage.width = 1920.0;
         self.project.stage.height = 1080.0;
-        self.layout_projectors(6);
-        self.status = "New show: 10400 × 1080 canvas, 6 projectors (224 px blends)".into();
+        self.project.outputs.clear();
+        self.status = "New show: 1920 × 1080 canvas, no projectors added".into();
     }
 
     /// Changes the canvas size only; projectors and layers keep their size.
@@ -1196,7 +1269,7 @@ impl ProducerApp {
                 .and_then(|p| self.timeline_drop_target(p))
                 .unwrap_or((self.playhead_seconds, None));
             for path in dropped {
-                self.import_path(&path, start, track);
+                self.begin_import(path, start, track);
             }
         }
 
@@ -2566,87 +2639,48 @@ impl ProducerApp {
             self.open_add_projector();
         }
 
-        section(ui, "Layout calculator");
-        let res = self
-            .project
-            .outputs
-            .first()
-            .map_or([1920, 1080], |o| o.resolution);
-        ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut self.layout_count).range(1..=32));
-            ui.label(format!(
-                "projectors of {}×{} across {:.0}×{:.0}",
-                res[0], res[1], self.project.stage.width, self.project.stage.height
-            ));
-        });
-        let (width, _, overlap) = self.layout_overlap(self.layout_count);
-        if overlap >= 0.0 {
-            ui.label(
-                RichText::new(format!(
-                    "= {overlap:.0} px overlap per seam ({:.1}% of each projector)",
-                    overlap / width * 100.0
-                ))
-                .color(LIVE),
-            );
-        } else {
-            ui.label(
-                RichText::new(format!(
-                    "= {:.0} px gaps between projectors: add more projectors",
-                    -overlap
-                ))
-                .color(DANGER),
-            );
-        }
-        if ui
-            .button("Apply layout")
-            .on_hover_text(
-                "Places the projectors at native size across the canvas and blends every \
-                 overlap. Names and Player PCs are kept; nothing is stretched.",
-            )
-            .clicked()
-        {
-            self.layout_projectors(self.layout_count);
-        }
-        ui.checkbox(
-            &mut self.auto_blend,
-            "Auto-blend overlaps when moving projectors",
-        );
-        section(ui, "Calibrate");
-        let identifying = self.project.test_pattern == TestPattern::Identify;
-        ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new("🔢 Identify projectors").selected(identifying))
-                .on_hover_text(
-                    "Every projector shows its number, name, Player IP and resolution with a \
-                     border and corner marks, so you can match and align them",
-                )
-                .clicked()
-            {
-                self.project.test_pattern = if identifying {
-                    TestPattern::Off
-                } else {
-                    TestPattern::Identify
-                };
+        ui.collapsing("Layout & overlap", |ui| {
+            let res = self.project.outputs.first().map_or([1920, 1080], |o| o.resolution);
+            ui.horizontal(|ui| {
+                ui.label("Projector count");
+                ui.add(egui::DragValue::new(&mut self.layout_count).range(1..=32));
+            });
+            let (width, _, overlap) = self.layout_overlap(self.layout_count);
+            ui.label(if overlap >= 0.0 {
+                format!("{overlap:.0} px overlap per seam ({:.1}%)", overlap / width * 100.0)
+            } else {
+                format!("{:.0} px gap — add projectors or change the count", -overlap)
+            });
+            ui.small(format!("{} × {} projector outputs across the stage", res[0], res[1]));
+            if ui.button("Arrange projectors and auto-blend").clicked() {
+                self.layout_projectors(self.layout_count);
             }
-            egui::ComboBox::from_id_salt("test_pattern")
-                .selected_text(pattern_name(self.project.test_pattern))
-                .show_ui(ui, |ui| {
-                    for pattern in [
-                        TestPattern::Off,
-                        TestPattern::Identify,
-                        TestPattern::Grid,
-                        TestPattern::White,
-                        TestPattern::Gray,
-                    ] {
-                        ui.selectable_value(
-                            &mut self.project.test_pattern,
-                            pattern,
-                            pattern_name(pattern),
-                        );
-                    }
-                });
+            ui.checkbox(&mut self.auto_blend, "Update blend when I move projectors");
         });
+        if ui.button("Auto-blend existing overlaps").clicked() {
+            self.project.auto_blend();
+        }
 
+        section(ui, "Test pattern");
+        ui.horizontal_wrapped(|ui| {
+            for pattern in [TestPattern::Off, TestPattern::Identify, TestPattern::Grid, TestPattern::White, TestPattern::Gray] {
+                let label = match pattern {
+                    TestPattern::Off => "Show content",
+                    TestPattern::Identify => "Numbers",
+                    TestPattern::Grid => "Grid",
+                    TestPattern::White => "White",
+                    TestPattern::Gray => "50% gray",
+                };
+                if ui.add(egui::Button::new(label).selected(self.project.test_pattern == pattern)).clicked() {
+                    self.project.test_pattern = pattern;
+                }
+            }
+        });
+        ui.small(if self.online {
+            "Player connected — patterns appear on the outputs."
+        } else {
+            "Player offline — changes are saved in this show and apply when connected."
+        });
         let Some(index) = self
             .project
             .outputs
@@ -2672,9 +2706,11 @@ impl ProducerApp {
                 status.state.as_ref().map(|s| s.displays.clone())
             })
             .unwrap_or_default();
-        let output = &mut self.project.outputs[index];
-        section(ui, &format!("Projector {}", index + 1));
         let mut geometry_changed = false;
+        let output = &mut self.project.outputs[index];
+        egui::CollapsingHeader::new(format!("Output & position · Projector {}", index + 1))
+            .default_open(false)
+            .show(ui, |ui| {
         egui::Grid::new("output_info")
             .num_columns(2)
             .spacing([8.0, 4.0])
@@ -2798,11 +2834,68 @@ impl ProducerApp {
             .color(MUTED),
         );
 
-        section(ui, "Corner correction");
+        });
+
+        egui::CollapsingHeader::new("Shape the output")
+            .default_open(true)
+            .show(ui, |ui| {
+        ui.small("Choose a starting shape, then drag the handles. Selecting a shape turns on the alignment grid.");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Flat wall").on_hover_text("Straight-on, flat projection. Clears any saved warp.").clicked() {
+                output.warp_mode = WarpMode::None;
+                output.warp_corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                output.warp_mesh = [[0.0, 0.0], [0.5, 0.0], [1.0, 0.0], [0.0, 0.5], [0.5, 0.5], [1.0, 0.5], [0.0, 1.0], [0.5, 1.0], [1.0, 1.0]];
+                self.project.test_pattern = TestPattern::Grid;
+            }
+            if ui.button("Angled wall").on_hover_text("Flat screen viewed at an angle; adjust the four corners.").clicked() {
+                output.warp_mode = WarpMode::Perspective;
+                self.project.test_pattern = TestPattern::Grid;
+            }
+            if ui.button("Curved wall").on_hover_text("Wall curves from left to right; adjust the middle row.").clicked() {
+                output.warp_mode = WarpMode::Horizontal;
+                self.project.test_pattern = TestPattern::Grid;
+            }
+            if ui.button("Curved top-bottom").on_hover_text("Surface curves from top to bottom; adjust the middle column.").clicked() {
+                output.warp_mode = WarpMode::Vertical;
+                self.project.test_pattern = TestPattern::Grid;
+            }
+            if ui.button("Custom surface").on_hover_text("Use the full grid for an irregular shape.").clicked() {
+                output.warp_mode = WarpMode::Full;
+                self.project.test_pattern = TestPattern::Grid;
+            }
+        });
+        ui.separator();
+        egui::ComboBox::from_id_salt(("warp_mode", output.id))
+            .selected_text(match output.warp_mode {
+                WarpMode::None => "Off — no correction",
+                WarpMode::Perspective => "Perspective — flat / angled screen",
+                WarpMode::Horizontal => "Horizontal curve — curved left to right",
+                WarpMode::Vertical => "Vertical curve — curved top to bottom",
+                WarpMode::Full => "Full grid — uneven or doubly curved",
+            })
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for (mode, title) in [
+                    (WarpMode::None, "Off — no correction"),
+                    (WarpMode::Perspective, "Perspective — flat / angled screen"),
+                    (WarpMode::Horizontal, "Horizontal curve — curved left to right"),
+                    (WarpMode::Vertical, "Vertical curve — curved top to bottom"),
+                    (WarpMode::Full, "Full grid — uneven or doubly curved"),
+                ] {
+                    if ui.selectable_value(&mut output.warp_mode, mode, title).changed() {
+                        geometry_changed = true;
+                    }
+                }
+            });
         ui.label(
             RichText::new(
-                "Move each output corner as a percentage of the projector image. Use the Grid \
-                 test pattern while aligning the physical surface.",
+                match output.warp_mode {
+                    WarpMode::None => "Correction is off. Choose a mode to start aligning the projected grid.",
+                    WarpMode::Perspective => "Drag the four corner handles to square up a flat screen. Use the Grid test pattern to align the physical surface.",
+                    WarpMode::Horizontal => "Drag the middle row to follow a surface curved from left to right.",
+                    WarpMode::Vertical => "Drag the middle column to follow a surface curved from top to bottom.",
+                    WarpMode::Full => "Drag grid points to fit an uneven or curved surface. Keep neighboring points in order.",
+                },
             )
             .small()
             .color(MUTED),
@@ -2826,6 +2919,7 @@ impl ProducerApp {
                 warp_preview.top() + corner[1] * warp_preview.height(),
             )
         });
+        if output.warp_mode == WarpMode::Perspective {
         ui.painter().add(egui::Shape::closed_line(
             corner_positions.to_vec(),
             egui::Stroke::new(2.0_f32, color),
@@ -2877,11 +2971,67 @@ impl ProducerApp {
                     ui.end_row();
                 }
             });
-        if ui.button("Reset corners").clicked() {
-            output.warp_corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         }
+        if output.warp_mode != WarpMode::Perspective && output.warp_mode != WarpMode::None {
+            for row in 0..3 {
+                let points: Vec<_> = (0..3).map(|col| {
+                    let p = output.warp_mesh[row * 3 + col];
+                    egui::pos2(warp_preview.left() + p[0] * warp_preview.width(), warp_preview.top() + p[1] * warp_preview.height())
+                }).collect();
+                ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7))));
+            }
+            for col in 0..3 {
+                let points: Vec<_> = (0..3).map(|row| {
+                    let p = output.warp_mesh[row * 3 + col];
+                    egui::pos2(warp_preview.left() + p[0] * warp_preview.width(), warp_preview.top() + p[1] * warp_preview.height())
+                }).collect();
+                ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7))));
+            }
+            for index in 0..9 {
+                let active = match output.warp_mode {
+                    WarpMode::Horizontal => (3..=5).contains(&index),
+                    WarpMode::Vertical => [1, 4, 7].contains(&index),
+                    WarpMode::Full => true,
+                    _ => false,
+                };
+                if !active { continue; }
+                let p = output.warp_mesh[index];
+                let mut position = egui::pos2(warp_preview.left() + p[0] * warp_preview.width(), warp_preview.top() + p[1] * warp_preview.height());
+                let handle = egui::Rect::from_center_size(position, egui::vec2(20.0, 20.0));
+                let response = ui.interact(handle, egui::Id::new(("warp_mesh", output.id, index)), egui::Sense::drag());
+                if let Some(pointer) = response.interact_pointer_pos().filter(|_| response.dragged()) {
+                    let base = [(index % 3) as f32 * 0.5, (index / 3) as f32 * 0.5];
+                    let x = ((pointer.x - warp_preview.left()) / warp_preview.width()).clamp(-0.5, 1.5);
+                    let y = ((pointer.y - warp_preview.top()) / warp_preview.height()).clamp(-0.5, 1.5);
+                    output.warp_mesh[index] = match output.warp_mode {
+                        WarpMode::Horizontal => [base[0], y],
+                        WarpMode::Vertical => [x, base[1]],
+                        _ => [x, y],
+                    };
+                    position = egui::pos2(
+                        warp_preview.left() + output.warp_mesh[index][0] * warp_preview.width(),
+                        warp_preview.top() + output.warp_mesh[index][1] * warp_preview.height(),
+                    );
+                    geometry_changed = true;
+                }
+                ui.painter().circle_filled(position, 6.0, Color32::WHITE);
+                ui.painter().circle_stroke(position, 6.0, egui::Stroke::new(2.0_f32, color));
+            }
+        }
+        if ui.button("Reset to flat").clicked() {
+            output.warp_corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            output.warp_mesh = [
+                [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+                [0.0, 1.0], [0.5, 1.0], [1.0, 1.0],
+            ];
+            output.warp_mode = WarpMode::None;
+            geometry_changed = true;
+        }
+        });
 
-        section(ui, "Polygon mask");
+        ui.collapsing("Mask spill (optional)", |ui| {
+        ui.small("Use this only to block projector light outside the screen. It does not warp the picture.");
         ui.checkbox(&mut output.mask.enabled, "Enable hard-edged mask");
         ui.label(
             RichText::new(
@@ -2891,8 +3041,59 @@ impl ProducerApp {
             .small()
             .color(MUTED),
         );
+        let (mask_preview, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 120.0),
+            egui::Sense::hover(),
+        );
+        let mask_preview = mask_preview.shrink(8.0);
+        ui.painter().rect_filled(mask_preview, 3.0, Color32::from_gray(8));
+        ui.painter().rect_stroke(
+            mask_preview,
+            3.0,
+            egui::Stroke::new(1.0_f32, Color32::from_gray(70)),
+            egui::StrokeKind::Inside,
+        );
+        let mask_points = output.mask.points.len();
+        let mut mask_screen_points: Vec<egui::Pos2> = output
+            .mask
+            .points
+            .iter()
+            .map(|point| {
+                egui::pos2(
+                    mask_preview.left() + point[0] * mask_preview.width(),
+                    mask_preview.top() + point[1] * mask_preview.height(),
+                )
+            })
+            .collect();
+        if mask_screen_points.len() > 1 {
+            ui.painter().add(egui::Shape::closed_line(
+                mask_screen_points.clone(),
+                egui::Stroke::new(2.0_f32, color),
+            ));
+        }
+        for (point_index, position) in mask_screen_points.iter_mut().enumerate() {
+            let hit_area = egui::Rect::from_center_size(*position, egui::vec2(20.0, 20.0));
+            let response = ui.interact(
+                hit_area,
+                egui::Id::new(("mask_point", output.id, point_index)),
+                egui::Sense::drag(),
+            );
+            if let Some(pointer) = response
+                .interact_pointer_pos()
+                .filter(|_| response.dragged())
+            {
+                output.mask.points[point_index] = [
+                    ((pointer.x - mask_preview.left()) / mask_preview.width()).clamp(0.0, 1.0),
+                    ((pointer.y - mask_preview.top()) / mask_preview.height()).clamp(0.0, 1.0),
+                ];
+                *position = pointer;
+            }
+            ui.painter().circle_filled(*position, 5.0, Color32::WHITE);
+            ui.painter()
+                .circle_stroke(*position, 5.0, egui::Stroke::new(2.0_f32, color));
+        }
         let mut remove_mask_point = None;
-        let mask_point_count = output.mask.points.len();
+        let mask_point_count = mask_points;
         for (point_index, point) in output.mask.points.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{}", point_index + 1));
@@ -2918,18 +3119,19 @@ impl ProducerApp {
         }
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(output.mask.points.len() < 64, egui::Button::new("+ Point"))
+                .add_enabled(output.mask.points.len() < 64, egui::Button::new("Add mask point"))
                 .clicked()
             {
                 let previous = output.mask.points.last().copied().unwrap_or([0.5, 0.5]);
                 output.mask.points.push(previous);
             }
-            if ui.button("Reset mask").clicked() {
+            if ui.button("Reset mask to full output").clicked() {
                 output.mask.points = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
             }
         });
 
-        section(ui, "Edge blending");
+        });
+        ui.collapsing("Blend projector overlap (optional)", |ui| {
         ui.label(
             RichText::new(
                 "Where projectors overlap their light adds up, so each one fades out across \
@@ -2958,7 +3160,8 @@ impl ProducerApp {
             .on_hover_text("Display gamma of the projector, usually 2.2");
         blend_curve_preview(ui, &output.blend);
 
-        section(ui, "Brightness & black level");
+        });
+        ui.collapsing("Brightness & black level (optional)", |ui| {
         ui.add(
             egui::Slider::new(&mut output.color.brightness, 0.3..=1.0)
                 .text("Brightness")
@@ -2980,14 +3183,8 @@ impl ProducerApp {
             output.blend.gamma = 2.2;
             output.color = OutputColor::default();
         }
+        });
         if geometry_changed && self.auto_blend {
-            self.project.auto_blend();
-        }
-        if ui
-            .button("Auto-blend all overlaps now")
-            .on_hover_text("Sets every projector's blend widths to its real overlap")
-            .clicked()
-        {
             self.project.auto_blend();
         }
     }
@@ -3604,6 +3801,7 @@ impl eframe::App for ProducerApp {
 
         self.refresh_links();
         self.thumbs.poll(ctx);
+        self.finish_imports();
         for asset in &self.project.assets {
             self.thumbs.request(asset, ctx);
         }
@@ -4208,6 +4406,30 @@ fn probe_media(path: &Path) -> (Option<u32>, Option<u32>, Option<f64>) {
         .and_then(|v| v.as_str())
         .and_then(|v| v.parse().ok());
     (width, height, duration)
+}
+
+fn inspect_media(path: &Path, kind: AssetKind) -> Result<Asset, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (width, height, duration_seconds) = if kind == AssetKind::Image {
+        match image::image_dimensions(path) {
+            Ok((w, h)) => (Some(w), Some(h), None),
+            Err(_) => (None, None, None),
+        }
+    } else {
+        probe_media(path)
+    };
+    let checksum_sha256 = sha256_file(path).map_err(|e| e.to_string())?;
+    Ok(Asset {
+        id: Uuid::new_v4(),
+        path: path.to_string_lossy().to_string(),
+        name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        kind,
+        checksum_sha256,
+        width,
+        height,
+        duration_seconds,
+        size_bytes: Some(metadata.len()),
+    })
 }
 
 fn main() -> eframe::Result<()> {

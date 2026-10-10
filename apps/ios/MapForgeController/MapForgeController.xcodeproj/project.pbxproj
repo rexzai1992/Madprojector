@@ -1,0 +1,26 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		A10000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 1600; TargetAttributes = {A10000000000000000000002 = {CreatedOnToolsVersion = 16.0; }; }; }; buildConfigurationList = A10000000000000000000010; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A10000000000000000000003; productRefGroup = A10000000000000000000004; projectDirPath = ""; projectRoot = ""; targets = (A10000000000000000000002,); };
+		A10000000000000000000002 /* MapForgeController */ = {isa = PBXNativeTarget; buildConfigurationList = A10000000000000000000011; buildPhases = (A10000000000000000000005, A10000000000000000000006, A10000000000000000000007,); buildRules = (); dependencies = (); name = MapForgeController; productName = MapForgeController; productReference = A10000000000000000000008; productType = "com.apple.product-type.application"; };
+		A10000000000000000000003 = {isa = PBXGroup; children = (A10000000000000000000009, A1000000000000000000000A, A10000000000000000000008,); sourceTree = "<group>"; };
+		A10000000000000000000004 = {isa = PBXGroup; children = (); name = Products; sourceTree = "<group>"; };
+		A10000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000B,); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000006 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000007 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A10000000000000000000008 /* MapForgeController.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MapForgeController.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000009 /* MapForgeControllerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MapForgeControllerApp.swift; sourceTree = "<group>"; };
+		A1000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1000000000000000000000B /* MapForgeControllerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009; };
+		A10000000000000000000010 /* Project config list */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000012, A10000000000000000000013,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A10000000000000000000011 /* Target config list */ = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000014, A10000000000000000000015,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A10000000000000000000012 /* Debug project */ = {isa = XCBuildConfiguration; buildSettings = {SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; }; name = Debug; };
+		A10000000000000000000013 /* Release project */ = {isa = XCBuildConfiguration; buildSettings = {SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; }; name = Release; };
+		A10000000000000000000014 /* Debug target */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; PRODUCT_BUNDLE_IDENTIFIER = com.rexzai1992.MapForgeController; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		A10000000000000000000015 /* Release target */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Info.plist; PRODUCT_BUNDLE_IDENTIFIER = com.rexzai1992.MapForgeController; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+	};
+	rootObject = A10000000000000000000001;
+}

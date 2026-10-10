@@ -11,6 +11,7 @@ egui.workspace = true
 earcutr.workspace = true
 image.workspace = true
 mapforge-core = { path = "../../crates/mapforge-core", features = ["ui"] }
+mdns-sd = "0.21.5"
 rodio.workspace = true
 serde.workspace = true
 sha2.workspace = true

@@ -1483,7 +1483,9 @@ impl ProducerApp {
     // --- Panels --------------------------------------------------------------
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // Keep the transport and project actions available on narrower windows
+        // without forcing the toolbar off the right edge.
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("MapForge").strong().size(18.0).color(ACCENT));
             ui.add(
                 egui::TextEdit::singleline(&mut self.project.name)
@@ -1792,14 +1794,22 @@ impl ProducerApp {
     fn left_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             self.scenes_ui(ui);
-            ui.add_space(8.0);
-            self.cues_ui(ui);
-            ui.add_space(8.0);
-            self.loops_ui(ui);
-            ui.add_space(8.0);
-            self.layers_ui(ui);
-            ui.add_space(8.0);
-            self.media_ui(ui);
+            let cue_count = self.scene().cues.len();
+            ui.collapsing(format!("Cues & start points ({cue_count})"), |ui| {
+                self.cues_ui(ui);
+            });
+            let loop_count = self.scene().loops.len();
+            ui.collapsing(format!("Loops ({loop_count})"), |ui| {
+                self.loops_ui(ui);
+            });
+            let layer_count = self.scene().layers.len();
+            ui.collapsing(format!("Layers ({layer_count})"), |ui| {
+                self.layers_ui(ui);
+            });
+            let media_count = self.project.assets.len();
+            ui.collapsing(format!("Media library ({media_count})"), |ui| {
+                self.media_ui(ui);
+            });
         });
     }
 
@@ -1886,7 +1896,6 @@ impl ProducerApp {
     }
 
     fn cues_ui(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Cues (start points) in this scene");
         let scene_id = self.scene().id;
         let scene_index = self.scene;
         if self.scene().cues.is_empty() {
@@ -1966,7 +1975,6 @@ impl ProducerApp {
     }
 
     fn loops_ui(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Loops in this scene");
         let scene_id = self.scene().id;
         let scene_index = self.scene;
         if self.scene().loops.is_empty() {
@@ -2134,7 +2142,6 @@ impl ProducerApp {
     }
 
     fn layers_ui(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Layers in this scene");
         let count = self.scene().layers.len();
         if count == 0 {
             ui.label(RichText::new("Empty scene. Drag media onto the timeline.").color(MUTED));
@@ -2195,7 +2202,6 @@ impl ProducerApp {
     }
 
     fn media_ui(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Media library");
         if self.project.assets.is_empty() {
             ui.label(
                 RichText::new("No media yet. Click “+ Add media” or drop files on the timeline.")
@@ -2275,15 +2281,12 @@ impl ProducerApp {
         egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
             EditMode::Layers => {
                 self.layer_properties(ui);
-                ui.add_space(8.0);
-                self.stage_ui(ui);
+                ui.collapsing("Canvas size", |ui| self.stage_ui(ui));
             }
             EditMode::Projectors => {
                 self.projectors_ui(ui);
-                ui.add_space(8.0);
-                self.lan_ui(ui);
-                ui.add_space(8.0);
-                self.stage_ui(ui);
+                ui.collapsing("Players & network", |ui| self.lan_ui(ui));
+                ui.collapsing("Canvas size", |ui| self.stage_ui(ui));
             }
         });
     }
@@ -2523,7 +2526,6 @@ impl ProducerApp {
     }
 
     fn stage_ui(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Stage (whole canvas)");
         ui.label(
             RichText::new("Changing the canvas size never resizes projectors or media.")
                 .small()
@@ -2582,6 +2584,29 @@ impl ProducerApp {
 
     fn projectors_ui(&mut self, ui: &mut egui::Ui) {
         section(ui, "Projectors");
+        if let Some(ip) = local_ip() {
+            let local_outputs = self
+                .project
+                .outputs
+                .iter()
+                .filter(|output| is_loopback_host(&mapforge_core::player_host(&output.player_address())))
+                .count();
+            ui.small(format!(
+                "This PC LAN IP: {ip}  |  Reuse one PC's IP for up to 4 projector outputs."
+            ));
+            if local_outputs > 0
+                && ui
+                    .button(format!("Use {ip} for {local_outputs} local projector(s)"))
+                    .on_hover_text("Replaces localhost on this show’s local projectors so the saved show lists this PC’s LAN IP. The Player can still run on this PC.")
+                    .clicked()
+            {
+                for output in &mut self.project.outputs {
+                    if is_loopback_host(&mapforge_core::player_host(&output.player_address())) {
+                        output.player = ip.clone();
+                    }
+                }
+            }
+        }
         let mut remove = None;
         let online: HashMap<String, bool> = self
             .links
@@ -2619,7 +2644,7 @@ impl ProducerApp {
                         remove = Some(output.id);
                     }
                     ui.label(
-                        RichText::new(mapforge_core::player_host(&address))
+                        RichText::new(display_player_host(&mapforge_core::player_host(&address)))
                             .small()
                             .monospace()
                             .color(if up { LIVE } else { DANGER }),
@@ -2706,6 +2731,7 @@ impl ProducerApp {
                 status.state.as_ref().map(|s| s.displays.clone())
             })
             .unwrap_or_default();
+        let player_targets = self.known_player_targets();
         let mut geometry_changed = false;
         let output = &mut self.project.outputs[index];
         egui::CollapsingHeader::new(format!("Output & position · Projector {}", index + 1))
@@ -2729,6 +2755,23 @@ impl ProducerApp {
                         "IP address of the PC this projector is plugged into (port 4777)",
                     );
                     this_pc_button(ui, &mut output.player);
+                });
+                ui.end_row();
+                ui.label("Quick assign");
+                ui.horizontal_wrapped(|ui| {
+                    if player_targets.is_empty() {
+                        ui.small("Open the Master and Sub Players to list them here.");
+                    } else {
+                        for (label, address) in &player_targets {
+                            if ui
+                                .selectable_label(output.player_address() == *address, label)
+                                .on_hover_text(address)
+                                .clicked()
+                            {
+                                output.player = address.clone();
+                            }
+                        }
+                    }
                 });
                 ui.end_row();
                 ui.label("Resolution");
@@ -3317,6 +3360,49 @@ impl ProducerApp {
         })
     }
 
+    /// Player PCs that can be selected for a projector. The Master reports
+    /// its connected Subs, so operators can assign outputs without retyping
+    /// every PC's address.
+    fn known_player_targets(&self) -> Vec<(String, String)> {
+        let mut targets = Vec::new();
+        for link in &self.links {
+            let status = link.status.lock().unwrap();
+            if !status.online {
+                continue;
+            }
+            let Some(state) = status.state.as_ref() else {
+                continue;
+            };
+            if state.role == Some(PlayerRole::Master) {
+                let raw_host = mapforge_core::player_host(&link.address);
+                let master_host = if is_loopback_host(&raw_host) {
+                    local_ip().unwrap_or(raw_host)
+                } else {
+                    raw_host
+                };
+                let master_address = mapforge_core::normalize_player_address(&master_host);
+                targets.push((
+                    format!("Master · {master_host}"),
+                    master_address,
+                ));
+                for follower in state.followers.iter().filter(|follower| follower.online) {
+                    let host = mapforge_core::player_host(&follower.address);
+                    let address = mapforge_core::normalize_player_address(&follower.address);
+                    targets.push((format!("Sub · {host}"), address));
+                }
+            } else if state.role == Some(PlayerRole::Sub) {
+                let host = mapforge_core::player_host(&link.address);
+                targets.push((
+                    format!("Sub · {host}"),
+                    mapforge_core::normalize_player_address(&link.address),
+                ));
+            }
+        }
+        let mut seen = HashSet::new();
+        targets.retain(|(_, address)| seen.insert(address.clone()));
+        targets
+    }
+
     /// Each Player's job, as chosen on that PC when it first started.
     fn show_pc_ui(&mut self, ui: &mut egui::Ui) {
         section(ui, "Show PCs");
@@ -3330,6 +3416,8 @@ impl ProducerApp {
             .small()
             .color(MUTED),
         );
+        ui.small("Assign each PC its LAN IP. Reuse an IP for the projector outputs plugged into that PC (up to 4 outputs per PC). Keep localhost for PC-only operation.");
+        let this_pc_ip = local_ip();
         let mut masters = 0;
         egui::Grid::new("show_pcs")
             .num_columns(3)
@@ -3345,8 +3433,21 @@ impl ProducerApp {
                         .filter(|o| o.player_address() == link.address)
                         .map(|o| o.name.as_str())
                         .collect();
-                    ui.label(RichText::new(link.host()).monospace());
-                    ui.label(RichText::new(names.join(", ")).small().color(MUTED));
+                    let host = link.host();
+                    let display_host = if is_loopback_host(&host) {
+                        this_pc_ip
+                            .as_ref()
+                            .map(|ip| format!("{ip} (this PC)"))
+                            .unwrap_or(host)
+                    } else {
+                        host
+                    };
+                    ui.label(RichText::new(display_host).monospace());
+                    ui.label(
+                        RichText::new(format!("{} output(s): {}", names.len(), names.join(", ")))
+                            .small()
+                            .color(MUTED),
+                    );
                     let (text, color) = match status.state.as_ref().filter(|_| status.online) {
                         None => ("offline".to_owned(), DANGER),
                         Some(state) => match state.role {
@@ -4265,19 +4366,54 @@ fn overlap_is_blended(a: &ProjectorOutput, b: &ProjectorOutput, overlap: egui::R
     }
 }
 
-/// Sets a projector to the Player on this computer: a one-PC setup needs no
-/// network. Shows "this PC" when it already is.
+/// Makes the local Player's usable LAN address visible while retaining an
+/// explicit localhost choice for one-PC setups.
 fn this_pc_button(ui: &mut egui::Ui, player: &mut String) {
     let host = mapforge_core::player_host(&mapforge_core::normalize_player_address(player));
-    if host == "127.0.0.1" || host == "localhost" {
-        ui.label(RichText::new("this PC").small().color(LIVE))
-            .on_hover_text("The Player on this computer. No LAN needed.");
-    } else if ui
-        .small_button("This PC")
-        .on_hover_text("One PC only: use the Player on this computer, no LAN needed")
-        .clicked()
-    {
-        *player = "127.0.0.1".into();
+    let local = local_ip();
+    if is_loopback_host(&host) {
+        ui.label(RichText::new("This PC · localhost").small().color(LIVE));
+        if let Some(ip) = local {
+            if ui
+                .small_button(format!("Use {ip}"))
+                .on_hover_text("Use this PC's LAN IP so other PCs can connect to its Player")
+                .clicked()
+            {
+                *player = ip;
+            }
+        }
+    } else if local.as_deref() == Some(host.as_str()) {
+        ui.label(RichText::new(format!("This PC · {host}")).small().color(LIVE));
+        if ui
+            .small_button("Localhost")
+            .on_hover_text("Use localhost when only this PC needs to control the Player")
+            .clicked()
+        {
+            *player = "127.0.0.1".into();
+        }
+    } else {
+        let label = local
+            .as_ref()
+            .map_or_else(|| "This PC".to_owned(), |ip| format!("This PC · {ip}"));
+        if ui
+            .small_button(label)
+            .on_hover_text("Assign this projector to the Player on this computer")
+            .clicked()
+        {
+            *player = local.unwrap_or_else(|| "127.0.0.1".into());
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "localhost"
+}
+
+fn display_player_host(host: &str) -> String {
+    if is_loopback_host(host) {
+        local_ip().map_or_else(|| host.to_owned(), |ip| format!("{ip} (this PC)"))
+    } else {
+        host.to_owned()
     }
 }
 

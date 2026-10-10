@@ -13,6 +13,7 @@ use mapforge_core::{
     ProjectorOutput, Scene, ShowProject, TestPattern, Transport, WarpMode, CONTROLLER_PORT,
     DEFAULT_PLAYER_PORT, PROTOCOL_VERSION,
 };
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use relay::Relay;
 use serde::Deserialize;
 use setup::PlayerSettings;
@@ -1562,6 +1563,10 @@ fn controller_json(runtime: &Runtime) -> String {
 
 fn http_server(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>, relay: Arc<Relay>) {
     let port = port_setting("MAPFORGE_HTTP_PORT", CONTROLLER_PORT);
+    // Advertise the controller through Bonjour/mDNS so the iOS app can find
+    // Players on the venue LAN without asking the operator for an IP address.
+    // Keep the daemon alive for as long as the HTTP listener is running.
+    let _discovery = advertise_controller(port);
     let listener = TcpListener::bind(("0.0.0.0", port))
         .unwrap_or_else(|_| panic!("HTTP port {port} is unavailable"));
     // One thread per request, so a large upload never blocks the controller.
@@ -1570,6 +1575,52 @@ fn http_server(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>, relay: Arc<Re
         let media = media.clone();
         let relay = relay.clone();
         thread::spawn(move || handle_http(stream, &shared, &media, &relay));
+    }
+}
+
+fn advertise_controller(port: u16) -> Option<ServiceDaemon> {
+    let computer = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "player".to_owned());
+    let host = computer
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .take(50)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_ascii_lowercase();
+    let host = if host.is_empty() { "player" } else { &host };
+    let instance = format!("MapForge {host}");
+    let hostname = format!("{host}.local.");
+    let daemon = match ServiceDaemon::new() {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            eprintln!("Could not start Bonjour discovery: {error}");
+            return None;
+        }
+    };
+    let info = match ServiceInfo::new(
+        "_mapforge._tcp.local.",
+        &instance,
+        &hostname,
+        "",
+        port,
+        &[("app", "mapforge")][..],
+    ) {
+        Ok(info) => info.enable_addr_auto(),
+        Err(error) => {
+            eprintln!("Could not create Bonjour service: {error}");
+            let _ = daemon.shutdown();
+            return None;
+        }
+    };
+    if let Err(error) = daemon.register(info) {
+        eprintln!("Could not advertise the controller on the LAN: {error}");
+        let _ = daemon.shutdown();
+        None
+    } else {
+        Some(daemon)
     }
 }
 

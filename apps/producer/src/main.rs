@@ -59,6 +59,9 @@ const RESOLUTION_PRESETS: [(u32, u32); 6] = [
     (2560, 1600),
     (3840, 2160),
 ];
+/// Longest controller page title and note, in bytes, a Player accepts.
+const CONTROLLER_TITLE_BYTES: usize = 200;
+const CONTROLLER_NOTE_BYTES: usize = 2000;
 /// Keys the Producer itself uses, which scenes and cues cannot take.
 const RESERVED_KEYS: [&str; 8] = [
     "Space",
@@ -211,7 +214,11 @@ struct ProducerApp {
     playhead_seconds: f64,
     timeline_scale: f32,
     last_frame: Instant,
-    confirm_new: bool,
+    /// An action waiting for the user to save or discard unsaved changes.
+    confirm: Option<PendingAction>,
+    /// Set once the user chose to quit without saving, so the close that
+    /// follows is not intercepted again.
+    allow_close: bool,
     /// Width and height edits keep the media's shape.
     keep_aspect: bool,
     history: history::History,
@@ -222,6 +229,15 @@ struct ProducerApp {
     layout_count: usize,
     timeline_zone: Option<timeline::DropZone>,
     window_title: String,
+}
+
+/// Something that would throw away unsaved changes, waiting for the user to
+/// save or discard them first.
+#[derive(Clone, Copy, PartialEq)]
+enum PendingAction {
+    New,
+    Open,
+    Quit,
 }
 
 /// Something waiting for the next key press to become its hotkey.
@@ -296,7 +312,8 @@ impl ProducerApp {
             playhead_seconds: 0.0,
             timeline_scale: 55.0,
             last_frame: Instant::now(),
-            confirm_new: false,
+            confirm: None,
+            allow_close: false,
             keep_aspect: true,
             history: history::History::new(&ShowProject::default()),
             clipboard: None,
@@ -359,14 +376,24 @@ impl ProducerApp {
         let mut online_states = Vec::new();
         let mut controller_updates = Vec::new();
         for link in &mut self.links {
-            let (online, state, reply, sync_failed) = {
+            let (online, state, reply, sync_failed, rejected, update) = {
                 let mut status = link.status.lock().unwrap();
                 let failed = std::mem::take(&mut status.sync_failed);
+                // Taken, not cloned, so one controller edit is merged once
+                // rather than every frame until the next poll.
+                let update = status
+                    .state
+                    .as_mut()
+                    .and_then(|s| s.project_update.take())
+                    .filter(|_| status.online)
+                    .map(|update| (*update, status.confirmed.clone()));
                 (
                     status.online,
                     status.state.clone(),
                     status.reply.take(),
                     failed,
+                    status.rejected.take(),
+                    update,
                 )
             };
             // A Player that just came online may have restarted without the show.
@@ -377,15 +404,22 @@ impl ProducerApp {
             if let Some(reply) = reply {
                 self.status = reply;
             }
-            if let Some(state) = state.filter(|_| online) {
-                if let Some(update) = state.project_update.as_deref() {
-                    controller_updates.push(update.clone());
+            // The Player kept its old show; say why, and don't count the
+            // link as synced or keep resending the same show.
+            if let Some((project, message)) = rejected {
+                if link.synced.as_ref() == Some(&project) {
+                    link.synced = None;
                 }
+                link.rejected = Some(project);
+                self.status = format!("{}: {message}", link.address);
+            }
+            if let Some(state) = state.filter(|_| online) {
                 online_states.push(state);
             }
+            controller_updates.extend(update);
         }
-        for update in controller_updates {
-            self.apply_player_project_update(update);
+        for (update, base) in controller_updates {
+            self.apply_player_project_update(update, base);
         }
         self.online = !online_states.is_empty();
         // Prefer a Player that has a scene loaded for the transport display.
@@ -397,21 +431,15 @@ impl ProducerApp {
     }
 
     /// Merges projector-only edits made from Player's web controller without
-    /// replacing unrelated unsaved edits in the Producer.
-    fn apply_player_project_update(&mut self, remote: ShowProject) {
+    /// replacing unrelated unsaved edits in the Producer. `base` is the show
+    /// that Player last accepted from us.
+    fn apply_player_project_update(&mut self, remote: ShowProject, base: Option<ShowProject>) {
         if remote.id != self.project.id {
             return;
         }
         let was_dirty = self.dirty();
         let mut updated = self.project.clone();
-        for output in &mut updated.outputs {
-            if let Some(from_player) = remote.outputs.iter().find(|o| o.id == output.id) {
-                output.stage_x = from_player.stage_x;
-                output.stage_y = from_player.stage_y;
-                output.blend = from_player.blend.clone();
-            }
-        }
-        updated.test_pattern = remote.test_pattern;
+        merge_controller_changes(&mut updated, &remote, base);
         if updated == self.project {
             return;
         }
@@ -475,9 +503,13 @@ impl ProducerApp {
         }
     }
 
-    /// Sends the show to every Player with the projectors assigned to it.
+    /// Sends the show to every Player that needs it, with the projectors
+    /// assigned to it.
     fn sync_now(&mut self) {
         for link in &mut self.links {
+            if !link_needs_sync(link, &self.project) {
+                continue;
+            }
             let outputs = self
                 .project
                 .outputs
@@ -485,7 +517,7 @@ impl ProducerApp {
                 .filter(|o| o.player_address() == link.address)
                 .map(|o| o.id)
                 .collect();
-            link.send_quiet(Command::LoadProject {
+            link.sync(Command::LoadProject {
                 project: self.project.clone(),
                 outputs: Some(outputs),
                 player: Some(link.address.clone()),
@@ -496,9 +528,7 @@ impl ProducerApp {
     }
 
     fn needs_sync(&self) -> bool {
-        self.links
-            .iter()
-            .any(|l| l.synced.as_ref() != Some(&self.project))
+        self.links.iter().any(|l| link_needs_sync(l, &self.project))
     }
 
     fn ensure_synced(&mut self) {
@@ -678,6 +708,26 @@ impl ProducerApp {
                     self.status = format!("Saved {}", path.display());
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
+            }
+        }
+    }
+
+    /// Runs `action` now, or asks first when it would lose unsaved changes.
+    fn confirm_or_run(&mut self, action: PendingAction) {
+        if self.dirty() {
+            self.confirm = Some(action);
+        } else {
+            self.run_pending(action);
+        }
+    }
+
+    fn run_pending(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::New => self.new_project(),
+            PendingAction::Open => self.open(),
+            PendingAction::Quit => {
+                self.allow_close = true;
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
@@ -1164,10 +1214,7 @@ impl ProducerApp {
         let (width, height, overlap) = self.layout_overlap(count);
         let template = self.project.outputs.first().cloned();
         while self.project.outputs.len() < count {
-            let mut output = template
-                .clone()
-                .unwrap_or_else(|| ShowProject::default().outputs[0].clone());
-            output.id = Uuid::new_v4();
+            let mut output = new_projector_like(template.as_ref());
             output.name = format!("Projector {}", self.project.outputs.len() + 1);
             let id = output.id;
             self.project.outputs.push(output);
@@ -1312,9 +1359,11 @@ impl ProducerApp {
 
         let command = Modifiers::COMMAND;
         let (save, save_as, open, import, duplicate) = ctx.input_mut(|i| {
+            // ⌘S also matches ⇧⌘S, so the Shift version must be taken first.
+            let save_as = i.consume_key(command | Modifiers::SHIFT, Key::S);
             (
                 i.consume_key(command, Key::S),
-                i.consume_key(command | Modifiers::SHIFT, Key::S),
+                save_as,
                 i.consume_key(command, Key::O),
                 i.consume_key(command, Key::I),
                 i.consume_key(command, Key::D),
@@ -1326,7 +1375,7 @@ impl ProducerApp {
             self.save(false);
         }
         if open {
-            self.open();
+            self.confirm_or_run(PendingAction::Open);
         }
         if import {
             self.pick_media();
@@ -1498,15 +1547,11 @@ impl ProducerApp {
             ui.separator();
             ui.menu_button("File", |ui| {
                 if ui.button("New show").clicked() {
-                    if self.dirty() {
-                        self.confirm_new = true;
-                    } else {
-                        self.new_project();
-                    }
+                    self.confirm_or_run(PendingAction::New);
                     ui.close_menu();
                 }
                 if ui.button("Open…   ⌘O").clicked() {
-                    self.open();
+                    self.confirm_or_run(PendingAction::Open);
                     ui.close_menu();
                 }
                 if ui.button("Save   ⌘S").clicked() {
@@ -3525,15 +3570,24 @@ impl ProducerApp {
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Title");
-                ui.add(egui::TextEdit::singleline(&mut settings.title).desired_width(260.0));
+                // Players refuse a show whose title or note is over these
+                // byte limits (see ShowProject::validate).
+                ui.add(
+                    egui::TextEdit::singleline(&mut settings.title)
+                        .char_limit(CONTROLLER_TITLE_BYTES)
+                        .desired_width(260.0),
+                );
+                truncate_to_bytes(&mut settings.title, CONTROLLER_TITLE_BYTES);
                 ui.end_row();
                 ui.label("Note");
                 ui.add(
                     egui::TextEdit::multiline(&mut settings.note)
+                        .char_limit(CONTROLLER_NOTE_BYTES)
                         .desired_rows(2)
                         .desired_width(260.0)
                         .hint_text("Instructions for the operator (optional)"),
                 );
+                truncate_to_bytes(&mut settings.note, CONTROLLER_NOTE_BYTES);
                 ui.end_row();
                 ui.label("Accent colour");
                 ui.color_edit_button_srgb(&mut settings.accent);
@@ -3767,12 +3821,13 @@ impl ProducerApp {
             if body.clicked() || body.drag_started() {
                 self.selected_layer = Some(layer.id);
             }
-            if body.dragged() && body.drag_delta() != egui::Vec2::ZERO {
+            if body.dragged() {
                 let delta = body.drag_delta() / scale;
-                layer.x += delta.x;
-                layer.y += delta.y;
-                layer.x = snap(layer.x, layer.width, stage_w, snap_distance);
-                layer.y = snap(layer.y, layer.height, stage_h, snap_distance);
+                let to = drag_total(&body, egui::vec2(layer.x, layer.y), delta);
+                if delta != egui::Vec2::ZERO {
+                    layer.x = snap(to.x, layer.width, stage_w, snap_distance);
+                    layer.y = snap(to.y, layer.height, stage_h, snap_distance);
+                }
             }
             if self.selected_layer == Some(layer.id) {
                 painter.rect_stroke(
@@ -3857,21 +3912,14 @@ impl ProducerApp {
                 if body.clicked() || body.drag_started() {
                     self.selected_output = Some(output.id);
                 }
-                if body.dragged() && body.drag_delta() != egui::Vec2::ZERO {
+                if body.dragged() {
                     let delta = body.drag_delta() / scale;
-                    output.stage_x = snap(
-                        output.stage_x + delta.x,
-                        output.stage_width,
-                        stage_w,
-                        snap_distance,
-                    );
-                    output.stage_y = snap(
-                        output.stage_y + delta.y,
-                        output.stage_height,
-                        stage_h,
-                        snap_distance,
-                    );
-                    geometry_changed = true;
+                    let to = drag_total(&body, egui::vec2(output.stage_x, output.stage_y), delta);
+                    if delta != egui::Vec2::ZERO {
+                        output.stage_x = snap(to.x, output.stage_width, stage_w, snap_distance);
+                        output.stage_y = snap(to.y, output.stage_height, stage_h, snap_distance);
+                        geometry_changed = true;
+                    }
                 }
             }
             painter.rect_stroke(
@@ -4092,7 +4140,13 @@ impl eframe::App for ProducerApp {
             }
         }
 
-        if self.confirm_new {
+        // Closing the window would lose unsaved work, so ask first.
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(PendingAction::Quit);
+        }
+
+        if let Some(action) = self.confirm {
             egui::Window::new("Discard unsaved changes?")
                 .collapsible(false)
                 .resizable(false)
@@ -4101,21 +4155,21 @@ impl eframe::App for ProducerApp {
                     ui.label("The current show has changes that are not saved.");
                     ui.horizontal(|ui| {
                         if ui.button("Save first").clicked() {
+                            self.confirm = None;
                             self.save(false);
                             if !self.dirty() {
-                                self.new_project();
+                                self.run_pending(action);
                             }
-                            self.confirm_new = false;
                         }
                         if ui
                             .add(egui::Button::new("Discard").fill(DANGER.gamma_multiply(0.6)))
                             .clicked()
                         {
-                            self.new_project();
-                            self.confirm_new = false;
+                            self.confirm = None;
+                            self.run_pending(action);
                         }
                         if ui.button("Cancel").clicked() {
-                            self.confirm_new = false;
+                            self.confirm = None;
                         }
                     });
                 });
@@ -4333,6 +4387,111 @@ fn resize_handle(
     }
 }
 
+/// Cuts `text` to at most `max` bytes without splitting a character.
+fn truncate_to_bytes(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+}
+
+/// A new projector with `template`'s Player PC, resolution and blend curve.
+/// Its display, warp, mask and colour start fresh: those are calibration for
+/// one physical projector, and a copied display would put two projectors on
+/// the same screen.
+fn new_projector_like(template: Option<&ProjectorOutput>) -> ProjectorOutput {
+    let fresh = ShowProject::default().outputs[0].clone();
+    let mut output = template.cloned().unwrap_or_else(|| fresh.clone());
+    output.id = Uuid::new_v4();
+    output.display_index = fresh.display_index;
+    output.warp_mode = fresh.warp_mode;
+    output.warp_corners = fresh.warp_corners;
+    output.warp_mesh = fresh.warp_mesh;
+    output.mask = fresh.mask;
+    output.color = fresh.color;
+    output
+}
+
+/// True when `project` should be sent to `link`: the Player doesn't have it
+/// yet, hasn't already turned this exact show down, and isn't known to be
+/// offline (it gets a full sync when it comes back).
+fn link_needs_sync(link: &PlayerLink, project: &ShowProject) -> bool {
+    link.synced.as_ref() != Some(project)
+        && link.rejected.as_ref() != Some(project)
+        && !link.status.lock().unwrap().unreachable
+}
+
+/// Copies projector positions, blends and the test pattern changed from a
+/// Player's controller into `local`. `base` is the show that Player last
+/// accepted from the Producer. A value is taken only when the Player's copy
+/// differs from `base` (the controller changed it) and the Producer's copy
+/// still equals `base` (no local edit since), so neither side's newer edits
+/// are thrown away. Without a base, the Player's values are taken as they are.
+fn merge_controller_changes(
+    local: &mut ShowProject,
+    remote: &ShowProject,
+    base: Option<ShowProject>,
+) {
+    // The Player snaps positions to whole pixels when a show arrives.
+    let base = base.map(|mut base| {
+        base.snap_to_pixels();
+        base
+    });
+    fn take<T: PartialEq + Clone>(local: &mut T, remote: T, base: Option<T>) {
+        if base.is_none_or(|base| remote != base && *local == base) {
+            *local = remote;
+        }
+    }
+    for output in &mut local.outputs {
+        let Some(from_player) = remote.outputs.iter().find(|o| o.id == output.id) else {
+            continue;
+        };
+        let before = base
+            .as_ref()
+            .and_then(|b| b.outputs.iter().find(|o| o.id == output.id));
+        let mut position = (output.stage_x, output.stage_y);
+        take(
+            &mut position,
+            (from_player.stage_x, from_player.stage_y),
+            before.map(|o| (o.stage_x, o.stage_y)),
+        );
+        (output.stage_x, output.stage_y) = position;
+        take(
+            &mut output.blend,
+            from_player.blend.clone(),
+            before.map(|o| o.blend.clone()),
+        );
+    }
+    take(
+        &mut local.test_pattern,
+        remote.test_pattern,
+        base.as_ref().map(|b| b.test_pattern),
+    );
+}
+
+/// The unsnapped value of the drag on `response`: `start` when the drag
+/// began plus every movement since. Snapping each frame's small movement
+/// would pull the item straight back to the snap point it is leaving, so a
+/// slow drag could never move it; only this running total is snapped.
+/// Call it on every frame the response is dragged, even without movement.
+pub(crate) fn drag_total<T>(response: &egui::Response, start: T, delta: T) -> T
+where
+    T: Clone + Send + Sync + std::ops::Add<Output = T> + 'static,
+{
+    let id = response.id.with("drag_total");
+    let base = if response.drag_started() {
+        None
+    } else {
+        response.ctx.data(|d| d.get_temp::<T>(id))
+    };
+    let total = base.unwrap_or(start) + delta;
+    response.ctx.data_mut(|d| d.insert_temp(id, total.clone()));
+    total
+}
+
 /// Snaps a position to the stage edges or centre when within `distance`.
 fn snap(position: f32, size: f32, total: f32, distance: f32) -> f32 {
     for target in [0.0, total - size, (total - size) / 2.0] {
@@ -4520,7 +4679,9 @@ fn probe_media(path: &Path) -> (Option<u32>, Option<u32>, Option<f64>) {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height:format=duration",
+            // Rotation comes from the display matrix (newer files) or the
+            // older `rotate` tag; phone videos are often stored sideways.
+            "stream=width,height:stream_side_data=rotation:stream_tags=rotate:format=duration",
             "-of",
             "json",
         ])
@@ -4532,6 +4693,13 @@ fn probe_media(path: &Path) -> (Option<u32>, Option<u32>, Option<f64>) {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
         return (None, None, None);
     };
+    parse_probe(&value)
+}
+
+/// Width, height and duration from ffprobe's JSON. The size is the one the
+/// video is shown at: a stream stored sideways with a 90° or 270° rotation
+/// has its width and height swapped, as FFmpeg does when it decodes it.
+fn parse_probe(value: &serde_json::Value) -> (Option<u32>, Option<u32>, Option<f64>) {
     let stream = value.get("streams").and_then(|v| v.get(0));
     let width = stream
         .and_then(|v| v.get("width"))
@@ -4546,7 +4714,20 @@ fn probe_media(path: &Path) -> (Option<u32>, Option<u32>, Option<f64>) {
         .and_then(|v| v.get("duration"))
         .and_then(|v| v.as_str())
         .and_then(|v| v.parse().ok());
-    (width, height, duration)
+    let side_data = stream
+        .and_then(|v| v.get("side_data_list"))
+        .and_then(|v| v.as_array())
+        .and_then(|list| list.iter().find_map(|d| d.get("rotation")?.as_f64()));
+    let tag = stream
+        .and_then(|v| v.get("tags"))
+        .and_then(|v| v.get("rotate"))
+        .and_then(|v| v.as_str().and_then(|s| s.trim().parse().ok()).or(v.as_f64()));
+    let quarter_turns = (side_data.or(tag).unwrap_or(0.0) / 90.0).round() as i64;
+    if quarter_turns.rem_euclid(2) == 1 {
+        (height, width, duration)
+    } else {
+        (width, height, duration)
+    }
 }
 
 fn inspect_media(path: &Path, kind: AssetKind) -> Result<Asset, String> {
@@ -4593,4 +4774,84 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_swaps_size_of_rotated_video() {
+        let probe = |stream: serde_json::Value| {
+            parse_probe(&serde_json::json!({
+                "streams": [stream],
+                "format": { "duration": "2.5" }
+            }))
+        };
+        let plain = probe(serde_json::json!({ "width": 1920, "height": 1080 }));
+        assert_eq!(plain, (Some(1920), Some(1080), Some(2.5)));
+        let side_data = probe(serde_json::json!({
+            "width": 1920, "height": 1080,
+            "side_data_list": [{ "side_data_type": "Display Matrix", "rotation": -90 }]
+        }));
+        assert_eq!(side_data, (Some(1080), Some(1920), Some(2.5)));
+        let tag = probe(serde_json::json!({
+            "width": 1920, "height": 1080, "tags": { "rotate": "270" }
+        }));
+        assert_eq!(tag, (Some(1080), Some(1920), Some(2.5)));
+        let upside_down = probe(serde_json::json!({
+            "width": 1920, "height": 1080, "side_data_list": [{ "rotation": 180 }]
+        }));
+        assert_eq!(upside_down, (Some(1920), Some(1080), Some(2.5)));
+    }
+
+    #[test]
+    fn truncate_to_bytes_keeps_whole_characters() {
+        let mut text = "aé€".to_string(); // 1 + 2 + 3 bytes
+        truncate_to_bytes(&mut text, 4);
+        assert_eq!(text, "aé");
+        truncate_to_bytes(&mut text, 10);
+        assert_eq!(text, "aé");
+    }
+
+    #[test]
+    fn new_projectors_do_not_copy_calibration() {
+        let mut template = ShowProject::default().outputs[0].clone();
+        template.display_index = Some(1);
+        template.warp_corners[0] = [0.1, 0.1];
+        template.mask.enabled = true;
+        template.color.brightness = 0.5;
+        template.player = "192.168.1.50".into();
+        let output = new_projector_like(Some(&template));
+        assert_ne!(output.id, template.id);
+        assert_eq!(output.display_index, None);
+        assert_eq!(output.warp_corners[0], [0.0, 0.0]);
+        assert!(!output.mask.enabled);
+        assert_eq!(output.color, OutputColor::default());
+        assert_eq!(output.player, template.player);
+        assert_eq!(output.resolution, template.resolution);
+    }
+
+    #[test]
+    fn controller_changes_merge_without_losing_local_edits() {
+        let base = ShowProject::default();
+        // The Producer moved projector 1 and hasn't sent it yet.
+        let mut local = base.clone();
+        local.outputs[0].stage_x += 100.0;
+        // The Player toggled the test pattern and swapped projector 2.
+        let mut remote = base.clone();
+        remote.test_pattern = TestPattern::Identify;
+        remote.outputs[1].stage_y += 50.0;
+
+        merge_controller_changes(&mut local, &remote, Some(base.clone()));
+        assert_eq!(local.outputs[0].stage_x, base.outputs[0].stage_x + 100.0);
+        assert_eq!(local.outputs[1].stage_y, base.outputs[1].stage_y + 50.0);
+        assert_eq!(local.test_pattern, TestPattern::Identify);
+
+        // Without a known base the Player's values are taken.
+        let mut local = base.clone();
+        local.outputs[0].stage_x += 100.0;
+        merge_controller_changes(&mut local, &remote, None);
+        assert_eq!(local.outputs[0].stage_x, base.outputs[0].stage_x);
+    }
 }

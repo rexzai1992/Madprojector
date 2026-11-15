@@ -22,98 +22,242 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct LinkStatus {
     pub online: bool,
+    /// The last exchange failed, so the Player is known to be unreachable.
+    /// A link that has not been tried yet is not unreachable.
+    pub unreachable: bool,
     pub state: Option<PlayerState>,
     pub reply: Option<String>,
     pub sync_failed: bool,
+    /// The show this Player last accepted. Controller edits made on the
+    /// Player are the differences between this and its `project_update`.
+    pub confirmed: Option<ShowProject>,
+    /// A show the Player turned down, with its reason.
+    pub rejected: Option<(ShowProject, String)>,
     pub latency_ms: Option<f64>,
     /// Player wall clock minus Producer wall clock, estimated at RTT midpoint.
     pub clock_offset_ms: Option<f64>,
 }
 
+/// Transport commands this old are dropped instead of sent while the Player
+/// is unreachable: replaying minutes-old GOs, stops and seeks when it comes
+/// back would only put it out of step with the others.
+const STALE_COMMAND: Duration = Duration::from_secs(3);
+
+/// Something waiting to be sent to one Player.
+enum Item {
+    /// Send the newest show waiting in the link's sync slot, if any.
+    Sync,
+    Command {
+        command: Command,
+        report: bool,
+        queued: Instant,
+    },
+}
+
+/// Settings where only the latest value matters, so a newer one replaces
+/// any older one still waiting.
+fn is_setting(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SetVolume { .. } | Command::SetMute { .. } | Command::SetBlackout { .. }
+    )
+}
+
+/// Commands waiting for one Player, in order. It stays small while a Player
+/// is offline or slow: the show itself waits in a single sync slot that every
+/// edit overwrites, settings keep only their newest value, and old transport
+/// commands are dropped while the Player can't be reached. So a GO never
+/// queues behind a backlog of stale shows.
+#[derive(Default)]
+struct Backlog {
+    items: std::collections::VecDeque<Item>,
+}
+
+impl Backlog {
+    fn push(&mut self, item: Item) {
+        match &item {
+            // A waiting marker already sends the newest show when reached.
+            Item::Sync if self.items.iter().any(|i| matches!(i, Item::Sync)) => return,
+            Item::Command { command, .. } if is_setting(command) => {
+                let kind = std::mem::discriminant(command);
+                self.items.retain(|i| {
+                    !matches!(i, Item::Command { command, .. }
+                        if std::mem::discriminant(command) == kind)
+                });
+            }
+            _ => {}
+        }
+        self.items.push_back(item);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The next item to send and how many stale commands were dropped to
+    /// reach it.
+    fn pop(&mut self, unreachable: bool, now: Instant) -> (Option<Item>, usize) {
+        let mut dropped = 0;
+        while let Some(item) = self.items.pop_front() {
+            let stale = matches!(&item, Item::Command { command, queued, .. }
+                if unreachable
+                    && !is_setting(command)
+                    && now.duration_since(*queued) > STALE_COMMAND);
+            if !stale {
+                return (Some(item), dropped);
+            }
+            dropped += 1;
+        }
+        (None, dropped)
+    }
+}
+
 pub struct PlayerLink {
     pub address: String,
-    tx: Sender<(Command, bool)>,
+    tx: Sender<Item>,
+    /// The newest show waiting to be sent; see [`Backlog`].
+    pending_sync: Arc<Mutex<Option<Command>>>,
     pub status: Arc<Mutex<LinkStatus>>,
     pub lan: Arc<Mutex<LanStatus>>,
     /// The show as last sent to this Player.
     pub synced: Option<ShowProject>,
+    /// The show this Player last turned down, so the same show is not sent
+    /// again until it is edited.
+    pub rejected: Option<ShowProject>,
     pub was_online: bool,
 }
 
 impl PlayerLink {
     pub fn spawn(address: String, ctx: egui::Context) -> Self {
-        let (tx, rx) = mpsc::channel::<(Command, bool)>();
+        let (tx, rx) = mpsc::channel::<Item>();
+        let pending_sync = Arc::new(Mutex::new(None::<Command>));
+        let worker_sync = pending_sync.clone();
         let status = Arc::new(Mutex::new(LinkStatus::default()));
         let worker_status = status.clone();
         let target = address.clone();
-        thread::spawn(move || loop {
-            let (command, report) = match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(message) => message,
-                Err(RecvTimeoutError::Timeout) => (Command::GetState, false),
-                Err(RecvTimeoutError::Disconnected) => return,
-            };
-            let is_sync = matches!(command, Command::LoadProject { .. });
-            let is_poll = matches!(command, Command::GetState);
-            let started = Instant::now();
-            let sent_unix_ms = unix_time_ms() as f64;
-            let result = exchange(&target, command);
-            {
-                let mut status = worker_status.lock().unwrap();
-                match result {
-                    Ok(state) => {
-                        status.online = true;
-                        let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
-                        if is_poll || status.latency_ms.is_none() {
-                            status.latency_ms = Some(rtt_ms);
-                        }
-                        if state.server_time_unix_ms > 0
-                            && (is_poll || status.clock_offset_ms.is_none())
-                        {
-                            status.clock_offset_ms = Some(estimate_clock_offset_ms(
-                                sent_unix_ms,
-                                rtt_ms,
-                                state.server_time_unix_ms as f64,
-                            ));
-                        }
-                        if report {
-                            status.reply = Some(state.message.clone());
-                        }
-                        status.state = Some(state);
-                    }
-                    Err(error) => {
-                        status.online = false;
-                        status.state = None;
-                        status.latency_ms = None;
-                        status.clock_offset_ms = None;
-                        status.sync_failed |= is_sync;
-                        if report {
-                            status.reply = Some(format!("{target} offline: {error}"));
-                        }
+        thread::spawn(move || {
+            let mut backlog = Backlog::default();
+            loop {
+                if backlog.is_empty() {
+                    match rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(item) => backlog.push(item),
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
+                while let Ok(item) = rx.try_recv() {
+                    backlog.push(item);
+                }
+                let unreachable = worker_status.lock().unwrap().unreachable;
+                let (next, dropped) = backlog.pop(unreachable, Instant::now());
+                if dropped > 0 {
+                    worker_status.lock().unwrap().reply = Some(format!(
+                        "{target} offline: skipped {dropped} old command(s)"
+                    ));
+                    ctx.request_repaint();
+                }
+                let (command, report) = match next {
+                    Some(Item::Command { command, report, .. }) => (command, report),
+                    Some(Item::Sync) => match worker_sync.lock().unwrap().take() {
+                        Some(command) => (command, false),
+                        None => continue,
+                    },
+                    None if dropped > 0 => continue,
+                    None => (Command::GetState, false),
+                };
+                exchange_and_record(&target, command, report, &worker_status);
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
         });
         Self {
             address,
             tx,
+            pending_sync,
             status,
             lan: Arc::new(Mutex::new(LanStatus::default())),
             synced: None,
+            rejected: None,
             was_online: false,
         }
     }
 
     pub fn send(&self, command: Command) {
-        let _ = self.tx.send((command, true));
+        let _ = self.tx.send(Item::Command {
+            command,
+            report: true,
+            queued: Instant::now(),
+        });
     }
 
-    pub fn send_quiet(&self, command: Command) {
-        let _ = self.tx.send((command, false));
+    /// Queues `command` (a `LoadProject`) in place of any show still waiting
+    /// to be sent to this Player.
+    pub fn sync(&self, command: Command) {
+        *self.pending_sync.lock().unwrap() = Some(command);
+        let _ = self.tx.send(Item::Sync);
     }
 
     pub fn host(&self) -> String {
         player_host(&self.address)
+    }
+}
+
+/// Sends one command and records the Player's answer in `status`.
+fn exchange_and_record(
+    target: &str,
+    command: Command,
+    report: bool,
+    status: &Mutex<LinkStatus>,
+) {
+    let sent_project = match &command {
+        Command::LoadProject { project, .. } => Some(project.clone()),
+        _ => None,
+    };
+    let is_sync = sent_project.is_some();
+    let is_poll = matches!(command, Command::GetState);
+    let started = Instant::now();
+    let sent_unix_ms = unix_time_ms() as f64;
+    let result = exchange(target, command);
+    let mut status = status.lock().unwrap();
+    match result {
+        Ok(state) => {
+            status.online = true;
+            status.unreachable = false;
+            let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if is_poll || status.latency_ms.is_none() {
+                status.latency_ms = Some(rtt_ms);
+            }
+            if state.server_time_unix_ms > 0 && (is_poll || status.clock_offset_ms.is_none()) {
+                status.clock_offset_ms = Some(estimate_clock_offset_ms(
+                    sent_unix_ms,
+                    rtt_ms,
+                    state.server_time_unix_ms as f64,
+                ));
+            }
+            if let Some(project) = sent_project {
+                // The Player answers a show it refuses with this message and
+                // keeps playing its old show.
+                if state.message.starts_with("Rejected project") {
+                    status.rejected = Some((project, state.message.clone()));
+                } else {
+                    status.confirmed = Some(project);
+                }
+            }
+            if report {
+                status.reply = Some(state.message.clone());
+            }
+            status.state = Some(state);
+        }
+        Err(error) => {
+            status.online = false;
+            status.unreachable = true;
+            status.state = None;
+            status.latency_ms = None;
+            status.clock_offset_ms = None;
+            status.sync_failed |= is_sync;
+            if report {
+                status.reply = Some(format!("{target} offline: {error}"));
+            }
+        }
     }
 }
 
@@ -345,4 +489,67 @@ fn http_call(
         .map(|(_, b)| b.to_string())
         .unwrap_or_default();
     Ok((code, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(command: Command, queued: Instant) -> Item {
+        Item::Command {
+            command,
+            report: true,
+            queued,
+        }
+    }
+
+    fn drain(backlog: &mut Backlog, unreachable: bool, now: Instant) -> Vec<String> {
+        let mut sent = Vec::new();
+        loop {
+            match backlog.pop(unreachable, now).0 {
+                Some(Item::Sync) => sent.push("Sync".to_string()),
+                Some(Item::Command { command, .. }) => sent.push(format!("{command:?}")),
+                None => return sent,
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_syncs_and_settings_do_not_pile_up() {
+        let now = Instant::now();
+        let mut backlog = Backlog::default();
+        for _ in 0..500 {
+            backlog.push(Item::Sync);
+            backlog.push(command(Command::SetVolume { value: 0.5 }, now));
+        }
+        backlog.push(command(Command::SetBlackout { value: true }, now));
+        backlog.push(command(Command::SetVolume { value: 0.2 }, now));
+        backlog.push(command(Command::Play, now));
+        assert_eq!(
+            drain(&mut backlog, false, now),
+            [
+                "Sync",
+                "SetBlackout { value: true }",
+                "SetVolume { value: 0.2 }",
+                "Play"
+            ]
+        );
+    }
+
+    #[test]
+    fn old_transport_commands_are_dropped_only_while_unreachable() {
+        let old = Instant::now();
+        let now = old + Duration::from_secs(10);
+        let mut backlog = Backlog::default();
+        backlog.push(command(Command::Stop, old));
+        backlog.push(command(Command::SetMute { value: true }, old));
+        backlog.push(command(Command::Play, now));
+        assert_eq!(
+            drain(&mut backlog, true, now),
+            ["SetMute { value: true }", "Play"]
+        );
+
+        backlog.push(command(Command::Stop, old));
+        assert_eq!(drain(&mut backlog, false, now), ["Stop"]);
+    }
 }

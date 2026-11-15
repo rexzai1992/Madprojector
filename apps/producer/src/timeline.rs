@@ -2,8 +2,8 @@
 //! and dragged between tracks, cue markers and drag-and-drop of media.
 
 use crate::{
-    end_action_name, format_timecode, kind_icon, EditMode, MediaDrag, ProducerApp, LIVE,
-    LOOP_COLOR, MUTED, WARN,
+    drag_total, end_action_name, format_timecode, kind_icon, EditMode, MediaDrag, ProducerApp,
+    LIVE, LOOP_COLOR, MUTED, WARN,
 };
 use eframe::egui::{self, Color32, RichText};
 use mapforge_core::{AssetKind, Transport};
@@ -51,6 +51,15 @@ fn clip_color(kind: &AssetKind, selected: bool) -> Color32 {
     } else {
         base
     }
+}
+
+/// Snap target times, leaving out those that belong to `owner`.
+fn snap_targets_without(targets: &[(Uuid, f64)], owner: Uuid) -> Vec<f64> {
+    targets
+        .iter()
+        .filter(|(id, _)| *id != owner)
+        .map(|(_, time)| *time)
+        .collect()
 }
 
 /// Snaps `value` to the nearest target within `distance` seconds.
@@ -245,17 +254,18 @@ impl ProducerApp {
                     }
                 }
 
-                // Snap targets: start, playhead, cues, loops and every clip edge.
+                // Snap targets: start, playhead, cues, loops and every clip
+                // edge, each with the clip or loop it belongs to.
                 let scene = self.scene();
-                let mut targets = vec![0.0, self.playhead_seconds];
-                targets.extend(scene.cues.iter().map(|c| c.time));
+                let mut targets = vec![(Uuid::nil(), 0.0), (Uuid::nil(), self.playhead_seconds)];
+                targets.extend(scene.cues.iter().map(|c| (Uuid::nil(), c.time)));
                 for region in &scene.loops {
-                    targets.push(region.start);
-                    targets.push(region.end);
+                    targets.push((region.id, region.start));
+                    targets.push((region.id, region.end));
                 }
                 for layer in &scene.layers {
-                    targets.push(layer.timeline_start);
-                    targets.push(layer.timeline_end());
+                    targets.push((layer.id, layer.timeline_start));
+                    targets.push((layer.id, layer.timeline_end()));
                 }
                 let snap_distance = (SNAP_PIXELS / scale) as f64;
 
@@ -409,16 +419,18 @@ impl ProducerApp {
                         (&left_edge, ClipEdit::TrimStart),
                         (&right_edge, ClipEdit::TrimEnd),
                     ] {
-                        if response.dragged()
-                            && response.drag_delta().x.abs() + response.drag_delta().y.abs() > 0.0
-                        {
+                        if !response.dragged() {
+                            continue;
+                        }
+                        let from = match kind {
+                            ClipEdit::Move | ClipEdit::TrimStart => layer.timeline_start,
+                            ClipEdit::TrimEnd => layer.timeline_end(),
+                        };
+                        let delta = (response.drag_delta().x / scale) as f64;
+                        let value = drag_total(response, from, delta);
+                        if response.drag_delta().x.abs() + response.drag_delta().y.abs() > 0.0 {
                             let pointer_y = response.interact_pointer_pos().map_or(top, |p| p.y);
-                            edit = Some((
-                                layer.id,
-                                kind,
-                                (response.drag_delta().x / scale) as f64,
-                                pointer_y,
-                            ));
+                            edit = Some((layer.id, kind, value, pointer_y));
                         }
                     }
                 }
@@ -437,14 +449,16 @@ impl ProducerApp {
                         self.mode = EditMode::Layers;
                     }
                 }
-                if let Some((id, kind, delta, pointer_y)) = edit {
-                    let others: Vec<f64> = targets.clone();
+                // `value` is the unsnapped dragged time; the clip's own
+                // edges are not targets, or it would stick where it was.
+                if let Some((id, kind, value, pointer_y)) = edit {
+                    let others = snap_targets_without(&targets, id);
                     let layers = &mut self.project.scenes[self.scene].layers;
                     if let Some(index) = layers.iter().position(|l| l.id == id) {
                         let layer = &mut layers[index];
                         match kind {
                             ClipEdit::Move => {
-                                let start = (layer.timeline_start + delta).max(0.0);
+                                let start = value.max(0.0);
                                 // Snap either edge, whichever is closer.
                                 let snapped_start = snap_time(start, &others, snap_distance);
                                 let snapped_end = snap_time(
@@ -472,7 +486,7 @@ impl ProducerApp {
                             ClipEdit::TrimStart => {
                                 let end = layer.timeline_end();
                                 let start = snap_time(
-                                    (layer.timeline_start + delta).clamp(0.0, end - 0.1),
+                                    value.clamp(0.0, end - 0.1),
                                     &others,
                                     snap_distance,
                                 )
@@ -486,8 +500,7 @@ impl ProducerApp {
                                 }
                             }
                             ClipEdit::TrimEnd => {
-                                let end =
-                                    snap_time(layer.timeline_end() + delta, &others, snap_distance);
+                                let end = snap_time(value, &others, snap_distance);
                                 layer.timeline_duration = (end - layer.timeline_start).max(0.1);
                             }
                         }
@@ -736,12 +749,12 @@ impl ProducerApp {
                             self.selected_cue = None;
                         }
                     }
-                    if body.dragged() && body.drag_delta().x != 0.0 {
-                        loop_edit = Some((
-                            region.id,
-                            ClipEdit::Move,
-                            (body.drag_delta().x / scale) as f64,
-                        ));
+                    if body.dragged() {
+                        let start =
+                            drag_total(&body, region.start, (body.drag_delta().x / scale) as f64);
+                        if body.drag_delta().x != 0.0 {
+                            loop_edit = Some((region.id, ClipEdit::Move, start));
+                        }
                     }
                     for (response, kind) in
                         [(&start, ClipEdit::TrimStart), (&end, ClipEdit::TrimEnd)]
@@ -755,16 +768,12 @@ impl ProducerApp {
                     }
                 }
                 if let Some((id, kind, value)) = loop_edit {
-                    let others: Vec<f64> = targets.clone();
+                    let others = snap_targets_without(&targets, id);
                     if let Some(region) = self.scene_mut().loops.iter_mut().find(|l| l.id == id) {
                         let length = region.end - region.start;
                         match kind {
                             ClipEdit::Move => {
-                                let start = snap_time(
-                                    (region.start + value).max(0.0),
-                                    &others,
-                                    snap_distance,
-                                );
+                                let start = snap_time(value.max(0.0), &others, snap_distance);
                                 region.start = start;
                                 region.end = start + length;
                             }

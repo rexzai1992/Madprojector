@@ -713,7 +713,10 @@ impl ShowProject {
     }
 
     /// Sets each output's feathers to the width it actually overlaps other
-    /// outputs on each side.
+    /// outputs on each side. Only an edge a neighbour crosses from outside
+    /// is feathered: a neighbour that coincides with an output (stacked for
+    /// brightness), contains it or sits inside it crosses none of its edges,
+    /// so it adds no feather rather than a full-height ramp.
     pub fn auto_blend(&mut self) {
         let rects: Vec<_> = self
             .outputs
@@ -739,17 +742,32 @@ impl ShowProject {
                 if overlap_x <= 0.0 || overlap_y <= 0.0 {
                     continue;
                 }
-                // A neighbour covering the full height blends a vertical edge.
-                if overlap_y >= overlap_x {
-                    if ol <= l {
-                        left = left.max(overlap_x);
-                    } else {
-                        right = right.max(overlap_x);
-                    }
-                } else if ot <= t {
-                    top = top.max(overlap_y);
+                // Which of this output's edges the neighbour crosses: it
+                // starts outside that edge and ends inside the output.
+                let horizontal = if ol < l && or < r {
+                    Some(&mut left)
+                } else if or > r && ol > l {
+                    Some(&mut right)
                 } else {
-                    bottom = bottom.max(overlap_y);
+                    None
+                };
+                let vertical = if ot < t && ob < b {
+                    Some(&mut top)
+                } else if ob > b && ot > t {
+                    Some(&mut bottom)
+                } else {
+                    None
+                };
+                match (horizontal, vertical) {
+                    (Some(side), None) => *side = side.max(overlap_x),
+                    (None, Some(side)) => *side = side.max(overlap_y),
+                    // A corner overlap: the longer side of the overlap runs
+                    // along the edge to blend.
+                    (Some(side), Some(_)) if overlap_y >= overlap_x => {
+                        *side = side.max(overlap_x)
+                    }
+                    (Some(_), Some(side)) => *side = side.max(overlap_y),
+                    (None, None) => {}
                 }
             }
             output.blend.left = left.min(output.stage_width);
@@ -1037,6 +1055,63 @@ mod tests {
         assert_eq!(p.outputs[0].blend.right, 120.0);
         assert_eq!(p.outputs[1].blend.left, 120.0);
         assert_eq!(p.outputs[0].blend.left, 0.0);
+    }
+
+    /// Two 1920×1080 projectors at the given stage positions, auto-blended;
+    /// returns each one's (left, right, top, bottom) feathers.
+    fn blend_pair(a: (f32, f32), b: (f32, f32)) -> [(f32, f32, f32, f32); 2] {
+        let mut p = ShowProject::default();
+        for (output, (x, y)) in p.outputs.iter_mut().zip([a, b]) {
+            output.stage_x = x;
+            output.stage_y = y;
+            output.stage_width = 1920.0;
+            output.stage_height = 1080.0;
+        }
+        p.auto_blend();
+        let sides =
+            |o: &ProjectorOutput| (o.blend.left, o.blend.right, o.blend.top, o.blend.bottom);
+        [sides(&p.outputs[0]), sides(&p.outputs[1])]
+    }
+
+    #[test]
+    fn auto_blend_leaves_stacked_and_nested_projectors_unfeathered() {
+        // Double-stacked for brightness.
+        assert_eq!(blend_pair((0.0, 0.0), (0.0, 0.0)), [(0.0, 0.0, 0.0, 0.0); 2]);
+
+        // A detail projector inside a bigger one.
+        let mut p = ShowProject::default();
+        p.outputs[0].stage_x = 0.0;
+        p.outputs[0].stage_y = 0.0;
+        p.outputs[0].stage_width = 3840.0;
+        p.outputs[0].stage_height = 2160.0;
+        p.outputs[1].stage_x = 960.0;
+        p.outputs[1].stage_y = 540.0;
+        p.outputs[1].stage_width = 1920.0;
+        p.outputs[1].stage_height = 1080.0;
+        p.auto_blend();
+        for output in &p.outputs {
+            let b = &output.blend;
+            assert_eq!((b.left, b.right, b.top, b.bottom), (0.0, 0.0, 0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn auto_blend_feathers_the_edge_a_neighbour_crosses() {
+        // Side by side with an overlap wider than the projector is tall.
+        assert_eq!(
+            blend_pair((0.0, 0.0), (820.0, 0.0)),
+            [(0.0, 1100.0, 0.0, 0.0), (1100.0, 0.0, 0.0, 0.0)]
+        );
+        // Stacked vertically with a 180 px overlap.
+        assert_eq!(
+            blend_pair((0.0, 0.0), (0.0, 900.0)),
+            [(0.0, 0.0, 0.0, 180.0), (0.0, 0.0, 180.0, 0.0)]
+        );
+        // Side by side but slightly offset vertically: still a side blend.
+        assert_eq!(
+            blend_pair((0.0, 0.0), (1700.0, 10.0)),
+            [(0.0, 220.0, 0.0, 0.0), (220.0, 0.0, 0.0, 0.0)]
+        );
     }
 
     #[test]

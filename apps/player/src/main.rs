@@ -156,8 +156,12 @@ impl Runtime {
         let port = address
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse::<u16>().ok());
+        // A loopback address is "this PC" as Producer sees it, which in a
+        // multi-PC show is the master. A sub taking it would draw the
+        // master's projectors instead of its own.
+        let loopback_is_me = is_loopback(address) && self.role() != Some(PlayerRole::Sub);
         port == Some(self.port)
-            && (is_loopback(address) || self.local_ips.contains(&player_host(address)))
+            && (loopback_is_me || self.local_ips.contains(&player_host(address)))
     }
 
     /// This PC's address in the show: as Producer sent it, or found from
@@ -4632,6 +4636,27 @@ mod render_tests {
         assert_eq!(runtime.state.transport, Transport::Playing);
         assert!(runtime.clock.position() >= 0.004);
         assert!(media.cued.lock().unwrap().is_none());
+    }
+
+    /// A two-PC show where Producer named the master's projector
+    /// 127.0.0.1: the sub must find itself by its own address, not take
+    /// the loopback projector (it drew the master's half instead of its own).
+    #[test]
+    fn a_sub_never_takes_the_loopback_projector() {
+        let mut project = ShowProject::default();
+        project.outputs[0].player = "127.0.0.1:4777".into();
+        project.outputs[1].player = "10.10.10.2:4777".into();
+        let mut runtime = Runtime {
+            project: Some(project),
+            port: DEFAULT_PLAYER_PORT,
+            local_ips: vec!["192.168.0.145".into(), "10.10.10.2".into()],
+            ..Default::default()
+        };
+        runtime.settings.role = Some(PlayerRole::Sub);
+        assert_eq!(runtime.own_address().as_deref(), Some("10.10.10.2:4777"));
+        assert!(!runtime.is_me("127.0.0.1:4777"));
+        runtime.settings.role = Some(PlayerRole::Master);
+        assert!(runtime.is_me("127.0.0.1:4777"), "on the master it still means this PC");
     }
 
     /// The master re-cues a follower and then releases its loop: the release

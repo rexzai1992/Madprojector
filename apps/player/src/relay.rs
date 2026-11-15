@@ -30,6 +30,14 @@ const OFFLINE_AFTER_FAILURES: u32 = 3;
 /// count as playing together: well above clock-sync error, and well below
 /// any loop.
 const IN_STEP_SECONDS: f64 = 0.1;
+/// A follower this far from the master (about 1.5 frames), or not playing
+/// the master's scene, is cued back in step even though it never went
+/// offline: a Player that restarted within the offline window comes back
+/// stopped, and any start that landed off time is corrected.
+const RECUE_SECONDS: f64 = 0.05;
+/// Least time between such re-cues, so a follower still starting the last
+/// cue (or missing media) is not cued over and over.
+const RECUE_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Status {
@@ -172,6 +180,7 @@ impl Follower {
         let status = Arc::new(Mutex::new(Status::default()));
         let worker_status = status.clone();
         let target = address.clone();
+        let mut last_recue: Option<Instant> = None;
         thread::spawn(move || loop {
             let command = match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(command) => command,
@@ -231,7 +240,14 @@ impl Follower {
                 continue;
             };
             let offset = worker_status.lock().unwrap().clock_offset_ms.unwrap_or(0.0);
-            let commands = if came_online || missed_command {
+            let recue = !came_online
+                && !missed_command
+                && last_recue.is_none_or(|t| t.elapsed() >= RECUE_EVERY)
+                && lost_step(&shared.lock().unwrap(), &state, offset);
+            if recue {
+                last_recue = Some(Instant::now());
+            }
+            let commands = if came_online || missed_command || recue {
                 catch_up(&shared, &target, offset, &state)
             } else if releasing {
                 after_release(&shared, &state, offset)
@@ -289,6 +305,31 @@ fn follower_drift(runtime: &Runtime, state: &PlayerState, offset_ms: f64) -> Opt
     let answered_ms = state.server_time_unix_ms as f64 - offset_ms;
     let since = ((unix_time_ms() as f64 - answered_ms) / 1000.0).max(0.0);
     Some(state.position_seconds + since - runtime.display_position())
+}
+
+/// Whether a follower that answered with `state` has fallen out of the show
+/// while this Player plays: stopped, on another scene, or well off time.
+/// Followers waiting for a scheduled start are left alone.
+fn lost_step(runtime: &Runtime, state: &PlayerState, offset_ms: f64) -> bool {
+    if runtime.state.transport != Transport::Playing
+        || runtime.scheduled.is_some()
+        || runtime.state.scene_id.is_none()
+        || state.scheduled_start_unix_ms.is_some()
+    {
+        return false;
+    }
+    // A cue lands a lead from now; if the master jumps (scene or loop end)
+    // before then, the follower would be placed past the jump and wrap on
+    // its own. Wait until the jump has passed.
+    let lead = LEAD_MS as f64 / 1000.0 + 0.3;
+    let position = runtime.clock.position();
+    if runtime.next_jump().is_some_and(|(_, _, at)| at > 0.0 && position + lead >= at) {
+        return false;
+    }
+    if state.transport != Transport::Playing || state.scene_id != runtime.state.scene_id {
+        return true;
+    }
+    follower_drift(runtime, state, offset_ms).is_some_and(|drift| drift.abs() >= RECUE_SECONDS)
 }
 
 /// Whether a follower placed at `seconds` should let go of the loops there:
@@ -584,6 +625,32 @@ mod tests {
         let mut stopped = follower_at(&runtime, 9.99);
         stopped.transport = Transport::Stopped;
         assert!(follower_drift(&runtime, &stopped, 0.0).is_none());
+    }
+
+    /// A sub restarted mid-show answers again before it counts as offline,
+    /// but stopped: the master must notice and bring it back.
+    #[test]
+    fn a_stopped_or_lost_follower_is_brought_back() {
+        let (runtime, _) = master_at(5.0);
+        assert!(!lost_step(&runtime, &follower_at(&runtime, 5.0), 0.0));
+        let mut stopped = follower_at(&runtime, 0.0);
+        stopped.transport = Transport::Stopped;
+        stopped.scene_id = None;
+        assert!(lost_step(&runtime, &stopped, 0.0));
+        assert!(lost_step(&runtime, &follower_at(&runtime, 3.0), 0.0), "2 s behind");
+        // Already cued and waiting for its start: leave it alone.
+        let mut waiting = stopped.clone();
+        waiting.scheduled_start_unix_ms = Some(unix_time_ms() + 500);
+        assert!(!lost_step(&runtime, &waiting, 0.0));
+        // A few frames off is corrected too.
+        assert!(lost_step(&runtime, &follower_at(&runtime, 4.9), 0.0), "100 ms behind");
+        // Not just before the master's loop end at 10 s: the cue would land past it.
+        let (near_end, _) = master_at(9.5);
+        assert!(!lost_step(&near_end, &stopped, 0.0));
+        // Nothing to bring it back to while the master is stopped.
+        let mut idle = runtime;
+        idle.state.transport = Transport::Stopped;
+        assert!(!lost_step(&idle, &stopped, 0.0));
     }
 
     #[test]

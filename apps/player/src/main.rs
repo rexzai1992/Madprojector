@@ -502,9 +502,11 @@ impl Runtime {
         // so nothing is restarted for it.
         if start.cut {
             let Some(project) = &self.project else {
+                media.drop_cue();
                 return;
             };
             if !project.scenes.iter().any(|s| s.id == start.scene_id) {
+                media.drop_cue();
                 self.state.message = "Unknown scene".into();
                 return;
             }
@@ -532,13 +534,13 @@ impl Runtime {
 
     /// Applies the scene's end action once the clock passes its last clip.
     fn handle_scene_end(&mut self, media: &MediaPool) {
-        // A cue is about to cut in: the outputs already wrap or hold this
-        // scene's end, and Stop or Next here would cancel the cue.
-        if self.state.transport != Transport::Playing
-            || self.scheduled.is_some_and(|start| start.cut)
-        {
+        if self.state.transport != Transport::Playing {
             return;
         }
+        // A cue is about to cut in. A looping scene still wraps, so its
+        // picture and sound carry on until the cut; Stop or Next would
+        // cancel the cue, so those scenes hold their last frame instead.
+        let cut_pending = self.scheduled.is_some_and(|start| start.cut);
         let Some(scene) = self.scene() else {
             return;
         };
@@ -560,6 +562,14 @@ impl Runtime {
                     since: Some(Instant::now()),
                 };
                 self.reset_loops(loop_start + overflow);
+            }
+            EndAction::Hold | EndAction::Stop | EndAction::Next if cut_pending => {
+                // Still "playing" for the other PCs; only the clock rests
+                // on the last frame until the cue replaces it.
+                self.clock = Clock {
+                    base: (end - 0.001).max(0.0),
+                    since: None,
+                };
             }
             EndAction::Hold => {
                 self.clock = Clock {
@@ -1038,6 +1048,10 @@ impl Decoder {
         // How long FFmpeg took to deliver its first frame: a restart aims
         // that far ahead of the show.
         let mut startup = 0.3_f64;
+        // Restarts in a row made to catch up with the show. The first frame
+        // after one is always shown, and after a few the clip plays on
+        // behind rather than restarting forever on a slow disk or file.
+        let mut resyncs = 0_u32;
         while !self.cancelled.load(Ordering::SeqCst) {
             let mut command = if tail {
                 ffmpeg_tail(&asset.path)
@@ -1088,8 +1102,9 @@ impl Decoder {
                 if stdout.read_exact(&mut rgba).is_err() {
                     break Run::Ended;
                 }
-                if frames == 0 {
-                    startup = spawned.elapsed().as_secs_f64().clamp(0.05, 3.0);
+                let first = frames == 0;
+                if first {
+                    startup = spawned.elapsed().as_secs_f64().clamp(0.05, 15.0);
                 }
                 let due = run_start + frames as f64 * frame_time;
                 frames += 1;
@@ -1097,12 +1112,13 @@ impl Decoder {
                     last = Some(rgba);
                     continue;
                 }
-                if published {
+                if published && !(first && resyncs > 0) {
                     match self.wait_until_due(due, last_shown) {
                         None => break Run::Cancelled,
                         Some(Pace::Drop) => continue,
-                        Some(Pace::Resync) => break Run::Resync,
-                        Some(_) => {}
+                        Some(Pace::Resync) if resyncs < 3 => break Run::Resync,
+                        Some(Pace::Resync) => {}
+                        Some(_) => resyncs = 0,
                     }
                 }
                 // Video is opaque, so its bytes are already egui's premultiplied
@@ -1118,7 +1134,10 @@ impl Decoder {
             let _ = child.wait();
             match run {
                 Run::Cancelled => return,
-                Run::Resync => run_start = self.clock().unwrap_or(run_start) + startup,
+                Run::Resync => {
+                    resyncs += 1;
+                    run_start = self.clock().unwrap_or(run_start) + startup;
+                }
                 Run::Ended if tail => {
                     match last {
                         Some(rgba) => self.publish(egui::ColorImage::from_rgba_premultiplied(
@@ -3781,7 +3800,14 @@ impl eframe::App for PlayerApp {
         self.update_textures(ctx);
         self.open_dropped_show(ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
-        if mapforge_core::update::bubble::show(ctx, &mut self.updater, None) {
+        // Updating closes the Player, which would take the projectors
+        // dark mid-show; it waits until the show is stopped.
+        let on_air = matches!(
+            self.shared.lock().unwrap().state.transport,
+            Transport::Playing | Transport::Ready
+        );
+        let blocked = on_air.then_some("Stop the show first, then update.");
+        if mapforge_core::update::bubble::show(ctx, &mut self.updater, blocked) {
             // The installer is open and replaces the programs once we close.
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -4218,7 +4244,52 @@ fn keep_screens_awake() {
 #[cfg(not(windows))]
 fn keep_screens_awake() {}
 
+/// Whether a Player is already open on this PC for `port`. A second one
+/// cannot take the network ports, yet it would still cover the projectors
+/// and, on a master, restart the show on every sub. The marker lives as
+/// long as this process, so the first Player keeps it.
+#[cfg(windows)]
+fn already_running(port: u16) -> bool {
+    use core::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(window: *mut c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const MB_ICONINFORMATION: u32 = 0x40;
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
+    let name = wide(&format!("Local\\MapForge-Player-{port}"));
+    // SAFETY: the strings are NUL-terminated and outlive the calls; the
+    // mutex handle is deliberately never closed.
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if handle.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide("MapForge Player is already open on this PC.").as_ptr(),
+            wide("MapForge Player").as_ptr(),
+            MB_ICONINFORMATION,
+        );
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn already_running(_: u16) -> bool {
+    false
+}
+
 fn main() -> eframe::Result<()> {
+    if already_running(port_setting("MAPFORGE_PORT", DEFAULT_PLAYER_PORT)) {
+        return Ok(());
+    }
     keep_screens_awake();
     let shared = Arc::new(Mutex::new(Runtime {
         settings: setup::load_settings(),
@@ -4876,6 +4947,46 @@ mod render_tests {
         runtime.scheduled.as_mut().unwrap().unix_ms = unix_time_ms().saturating_sub(5);
         runtime.handle_scheduled_start(&media);
         assert!(!runtime.armed(&region), "the loop is released once the cue lands");
+    }
+
+    /// A cue pressed in the last moments of a pass: the scene on air must
+    /// carry on until the cut, not freeze or go black for the cue's lead.
+    #[test]
+    fn a_scene_reaching_its_end_carries_on_until_a_waiting_cue_cuts_in() {
+        let mut project = ShowProject::default();
+        let output = project.outputs[0].clone();
+        let other = asset(AssetKind::Unknown, 0, 0);
+        let clip = layer(&other, &output, 100.0, 100.0); // 15 s long
+        project.assets = vec![other];
+        project.scenes[0].layers = vec![clip];
+        project.scenes[0].end_action = EndAction::Loop;
+        project.scenes.push(Scene::new("Scene 2"));
+        let (first, second) = (project.scenes[0].id, project.scenes[1].id);
+        let media = MediaPool::default();
+        let mut runtime = Runtime {
+            project: Some(project),
+            ..Default::default()
+        };
+        runtime.play(&media);
+        runtime.schedule(&media, second, 0.0, unix_time_ms() + 60_000);
+        let past_the_end = || Clock {
+            base: 15.02,
+            since: Some(Instant::now()),
+        };
+        // A looping scene wraps as usual.
+        runtime.clock = past_the_end();
+        runtime.handle_scene_end(&media);
+        assert!(runtime.clock.position() < 1.0, "wrapped to the start");
+        assert_eq!(runtime.state.scene_id, Some(first));
+        assert!(runtime.scheduled.is_some(), "the cue still waits");
+        // A scene that stops at its end holds its last frame instead of
+        // stopping, which would cancel the cue.
+        runtime.project.as_mut().unwrap().scenes[0].end_action = EndAction::Stop;
+        runtime.clock = past_the_end();
+        runtime.handle_scene_end(&media);
+        assert_eq!(runtime.state.transport, Transport::Playing);
+        assert!((runtime.clock.position() - 14.999).abs() < 0.01);
+        assert!(runtime.scheduled.is_some());
     }
 
     #[test]

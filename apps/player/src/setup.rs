@@ -131,14 +131,24 @@ pub fn local_ip() -> Option<String> {
 /// Every two seconds: fetch the master's show, take it if it changed, and
 /// copy any media this PC is missing.
 pub fn follow_master(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>) {
+    // After a failure the next try waits longer, up to 30 s, so a full
+    // disk or a broken file is not copied again from the start every 2 s
+    // during a show. One success returns to checking every 2 s.
+    let mut wait = Duration::from_secs(2);
     loop {
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(wait);
         let Some(http) = shared.lock().unwrap().settings.master_http() else {
             continue;
         };
         let note = match sync_with_master(&http, &shared, &media) {
-            Ok(note) => note,
-            Err(error) => format!("Can't reach the master at {http}: {error}"),
+            Ok(note) => {
+                wait = Duration::from_secs(2);
+                note
+            }
+            Err(error) => {
+                wait = (wait * 2).min(Duration::from_secs(30));
+                format!("Can't sync with the master at {http}: {error}")
+            }
         };
         shared.lock().unwrap().link_note = note;
     }
@@ -179,8 +189,13 @@ fn sync_with_master(
             me.is_some() && (runtime.outputs.as_ref() != Some(&outputs) || runtime.address != me);
         if runtime.project.as_ref() == Some(&project) && !wrong_projectors {
             None
+        } else if me.is_some() {
+            Some((me, Some(outputs)))
         } else {
-            Some((me, outputs))
+            // This PC is not named in the show by an address it knows as
+            // its own. Taking "no projectors" would close its outputs, so
+            // it keeps the projectors and address the master last sent.
+            Some((runtime.address.clone(), runtime.outputs.clone()))
         }
     };
     if let Some((me, outputs)) = me {
@@ -189,7 +204,7 @@ fn sync_with_master(
             media,
             Command::LoadProject {
                 project: project.clone(),
-                outputs: Some(outputs),
+                outputs,
                 player: me,
             },
         );
@@ -200,6 +215,7 @@ fn sync_with_master(
         .filter(|a| !asset_status(a).ready)
         .cloned()
         .collect();
+    let mut failed = Vec::new();
     for (index, asset) in missing.iter().enumerate() {
         let label = format!(
             "Copying media from the master ({}/{}): {}",
@@ -207,7 +223,16 @@ fn sync_with_master(
             missing.len(),
             asset.name
         );
-        download(http, asset, &label, shared, media).map_err(|e| format!("{}: {e}", asset.name))?;
+        if let Err(e) = download(http, asset, &label, shared, media) {
+            failed.push(format!("{}: {e}", asset.name));
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} media file(s) could not be copied ({})",
+            failed.len(),
+            failed.join("; ")
+        ));
     }
     let runtime = shared.lock().unwrap();
     let mine: Vec<&str> = project

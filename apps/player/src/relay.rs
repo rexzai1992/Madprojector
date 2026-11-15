@@ -61,7 +61,12 @@ impl Status {
         // Let the best round trip age slowly, so the offset keeps tracking
         // drift between the PCs' clocks.
         self.best_rtt_ms *= 1.02;
-        if self.samples == 0 || rtt_ms <= self.best_rtt_ms {
+        // A reading that disagrees by more than both round trips can explain
+        // means a clock was set (Windows time sync), not a slow answer.
+        let stepped = self.clock_offset_ms.is_some_and(|kept| {
+            (offset_ms - kept).abs() > (rtt_ms + self.best_rtt_ms) / 2.0 + 30.0
+        });
+        if self.samples == 0 || rtt_ms <= self.best_rtt_ms || stepped {
             self.best_rtt_ms = rtt_ms;
             self.clock_offset_ms = Some(offset_ms);
         }
@@ -178,6 +183,9 @@ impl Follower {
         let worker_status = status.clone();
         let target = address.clone();
         let mut last_recue: Option<Instant> = None;
+        // Polls in a row that found the follower out of step. One alone can
+        // be a reading taken just as one PC wrapped a loop and not the other.
+        let mut out_of_step = 0_u32;
         thread::spawn(move || loop {
             let command = match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(command) => command,
@@ -237,12 +245,18 @@ impl Follower {
                 continue;
             };
             let offset = worker_status.lock().unwrap().clock_offset_ms.unwrap_or(0.0);
+            if lost_step(&shared.lock().unwrap(), &state, offset) {
+                out_of_step += 1;
+            } else {
+                out_of_step = 0;
+            }
             let recue = !came_online
                 && !missed_command
-                && last_recue.is_none_or(|t| t.elapsed() >= RECUE_EVERY)
-                && lost_step(&shared.lock().unwrap(), &state, offset);
+                && out_of_step >= 2
+                && last_recue.is_none_or(|t| t.elapsed() >= RECUE_EVERY);
             if recue {
                 last_recue = Some(Instant::now());
+                out_of_step = 0;
             }
             let commands = if came_online || missed_command || recue {
                 catch_up(&shared, &target, offset, &state)
@@ -308,10 +322,16 @@ fn follower_drift(runtime: &Runtime, state: &PlayerState, offset_ms: f64) -> Opt
 /// while this Player plays: stopped, on another scene, or well off time.
 /// Followers waiting for a scheduled start are left alone.
 fn lost_step(runtime: &Runtime, state: &PlayerState, offset_ms: f64) -> bool {
+    // A follower about to start is left alone, but only for a start that is
+    // really near: one far in its future (its clock was set meanwhile)
+    // would otherwise never be corrected.
+    let starting_soon = state
+        .scheduled_start_unix_ms
+        .is_some_and(|start| start.saturating_sub(state.server_time_unix_ms) <= LEAD_MS + 1000);
     if runtime.state.transport != Transport::Playing
         || runtime.scheduled.is_some()
         || runtime.state.scene_id.is_none()
-        || state.scheduled_start_unix_ms.is_some()
+        || starting_soon
     {
         return false;
     }
@@ -321,6 +341,13 @@ fn lost_step(runtime: &Runtime, state: &PlayerState, offset_ms: f64) -> bool {
     let lead = LEAD_MS as f64 / 1000.0 + 0.3;
     let position = runtime.clock.position();
     if runtime.next_jump().is_some_and(|(_, _, at)| at > 0.0 && position + lead >= at) {
+        return false;
+    }
+    // The same near a scene end that holds or stops instead of jumping.
+    if runtime.scene().is_some_and(|scene| {
+        let end = scene.duration();
+        end > 0.0 && position + lead >= end
+    }) {
         return false;
     }
     if state.transport != Transport::Playing || state.scene_id != runtime.state.scene_id {
@@ -530,6 +557,18 @@ mod tests {
         assert_eq!(status.samples, 3);
     }
 
+    /// Windows time sync sets a PC's clock mid-show: the old offset would
+    /// be wrong by the whole step until a quicker answer happened to arrive.
+    #[test]
+    fn a_set_clock_replaces_the_offset_at_once() {
+        let mut status = Status::default();
+        status.record(2.0, 3.0);
+        status.record(2.5, 12.0); // a slower answer on the same clock
+        assert_eq!(status.clock_offset_ms, Some(2.0));
+        status.record(5002.0, 14.0); // the follower's clock was set by 5 s
+        assert_eq!(status.clock_offset_ms, Some(5002.0));
+    }
+
     #[test]
     fn one_failed_poll_does_not_take_a_follower_offline() {
         let mut status = Status::default();
@@ -644,6 +683,10 @@ mod tests {
         // Not just before the master's loop end at 10 s: the cue would land past it.
         let (near_end, _) = master_at(9.5);
         assert!(!lost_step(&near_end, &stopped, 0.0));
+        // A start an hour away is a start that will not happen: bring it back.
+        let mut far = stopped.clone();
+        far.scheduled_start_unix_ms = Some(unix_time_ms() + 3_600_000);
+        assert!(lost_step(&runtime, &far, 0.0));
         // Nothing to bring it back to while the master is stopped.
         let mut idle = runtime;
         idle.state.transport = Transport::Stopped;

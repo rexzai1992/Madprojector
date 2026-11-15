@@ -455,7 +455,8 @@ document.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
   if (key === 'b') { toggleBlackout(); return; }
   const scene = (controller.scenes || []).find((s) => (s.hotkey || '').toLowerCase() === key);
-  if (scene) post('scene/' + scene.index);
+  // Scene hotkeys are often F-keys; keep the browser from reloading or searching.
+  if (scene) { e.preventDefault(); post('scene/' + scene.index); }
 });
 
 /* ---------- rendering ---------- */

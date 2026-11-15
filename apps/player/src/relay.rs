@@ -29,13 +29,10 @@ const OFFLINE_AFTER_FAILURES: u32 = 3;
 /// How far apart, in seconds, a follower and this Player may be and still
 /// count as playing together: well above clock-sync error, and well below
 /// any loop.
-const IN_STEP_SECONDS: f64 = 0.1;
-/// A follower this far from the master (about 1.5 frames), or not playing
-/// the master's scene, is cued back in step even though it never went
-/// offline: a Player that restarted within the offline window comes back
-/// stopped, and any start that landed off time is corrected.
-const RECUE_SECONDS: f64 = 0.05;
-/// Least time between such re-cues, so a follower still starting the last
+const IN_STEP_SECONDS: f64 = 0.05;
+/// Least time between re-cues of a follower that fell out of step without
+/// going offline (a Player restarted within the offline window comes back
+/// stopped; a start can land off time), so a follower still starting the last
 /// cue (or missing media) is not cued over and over.
 const RECUE_EVERY: Duration = Duration::from_secs(5);
 
@@ -329,7 +326,7 @@ fn lost_step(runtime: &Runtime, state: &PlayerState, offset_ms: f64) -> bool {
     if state.transport != Transport::Playing || state.scene_id != runtime.state.scene_id {
         return true;
     }
-    follower_drift(runtime, state, offset_ms).is_some_and(|drift| drift.abs() >= RECUE_SECONDS)
+    follower_drift(runtime, state, offset_ms).is_some_and(|drift| drift.abs() >= IN_STEP_SECONDS)
 }
 
 /// Whether a follower placed at `seconds` should let go of the loops there:

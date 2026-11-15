@@ -2,7 +2,10 @@
 //! keeps up with its master: it fetches the show and any missing media from
 //! the master, so Producer only has to reach the master.
 
-use crate::{apply_local, asset_status, cached_path, media_cache_dir, MediaPool, Runtime};
+use crate::{
+    apply_local, asset_status, cached_path, media_cache_dir, partial_path, MediaPool, Runtime,
+    Transfer,
+};
 use mapforge_core::{net::connect, Asset, Command, PlayerRole, ShowProject, CONTROLLER_PORT};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -158,19 +161,25 @@ fn sync_with_master(
             }
         }
         let me = project.players().into_iter().find(|a| runtime.is_me(a));
-        if runtime.project.as_ref() == Some(&project) {
-            None
-        } else {
-            Some(me)
-        }
-    };
-    if let Some(me) = me {
-        let outputs = project
+        let outputs: Vec<Uuid> = project
             .outputs
             .iter()
             .filter(|o| Some(o.player_address()) == me)
             .map(|o| o.id)
             .collect();
+        // Same show, but drawing someone else's projectors: older masters
+        // passed their own projectors on with iPad edits. Only corrected when
+        // this PC found itself in the show, so a PC the master reaches on an
+        // address this check doesn't know keeps what the master sent.
+        let wrong_projectors =
+            me.is_some() && (runtime.outputs.as_ref() != Some(&outputs) || runtime.address != me);
+        if runtime.project.as_ref() == Some(&project) && !wrong_projectors {
+            None
+        } else {
+            Some((me, outputs))
+        }
+    };
+    if let Some((me, outputs)) = me {
         apply_local(
             shared,
             media,
@@ -223,9 +232,14 @@ fn download(
     shared: &Mutex<Runtime>,
     media: &MediaPool,
 ) -> Result<(), String> {
+    // Producer may be sending the same file to this PC right now; the next
+    // round finds it ready, or copies it if that transfer failed.
+    let Some(_transfer) = Transfer::begin(asset) else {
+        return Ok(());
+    };
     let (length, mut body) = http_get(http, &format!("/api/media/{}", asset.id))?;
     let target = cached_path(asset);
-    let partial = target.with_extension("part");
+    let partial = partial_path(asset);
     let result = (|| -> Result<String, String> {
         fs::create_dir_all(media_cache_dir()).map_err(|e| e.to_string())?;
         let mut file =
@@ -256,7 +270,10 @@ fn download(
     })();
     match result {
         Ok(checksum) if checksum == asset.checksum_sha256 => {
-            fs::rename(&partial, &target).map_err(|e| e.to_string())?;
+            if let Err(error) = fs::rename(&partial, &target) {
+                let _ = fs::remove_file(&partial);
+                return Err(error.to_string());
+            }
             let runtime = shared.lock().unwrap();
             if let (Some(project), Some(scene_id)) = (&runtime.project, runtime.state.scene_id) {
                 media.sync(project, scene_id, false, runtime.clock.position());

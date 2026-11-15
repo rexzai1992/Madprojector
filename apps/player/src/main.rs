@@ -1225,6 +1225,127 @@ fn cached_path(asset: &Asset) -> PathBuf {
     media_cache_dir().join(format!("{}.{ext}", asset.id))
 }
 
+/// A file of its own for one transfer of `asset`, next to the cached copy.
+/// Two transfers of the same file (Producer sending it while this sub copies
+/// it from the master, or two Players sharing one media folder) never write
+/// into each other's file.
+fn partial_path(asset: &Asset) -> PathBuf {
+    media_cache_dir().join(format!("{}.{}.part", asset.id, Uuid::new_v4().simple()))
+}
+
+/// Deletes partial files of `asset` left behind by a transfer that was cut
+/// off when the Player closed. A running transfer writes to its file all the
+/// time, so one untouched for ten minutes is abandoned.
+fn remove_stale_partials(asset: &Asset) {
+    let prefix = format!("{}.", asset.id);
+    let Ok(entries) = fs::read_dir(media_cache_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(600));
+        if name.starts_with(&prefix) && name.ends_with(".part") && stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Assets being received right now, from Producer or from the master.
+fn transfers() -> &'static Mutex<HashSet<Uuid>> {
+    static TRANSFERS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    TRANSFERS.get_or_init(Default::default)
+}
+
+/// Holds one asset as "being received" until dropped, so this Player only
+/// writes one copy of a file at a time.
+struct Transfer(Uuid);
+
+impl Transfer {
+    /// `None` when the asset is already being received.
+    fn begin(asset: &Asset) -> Option<Self> {
+        let started = transfers().lock().ok()?.insert(asset.id);
+        if started {
+            remove_stale_partials(asset);
+        }
+        started.then(|| Transfer(asset.id))
+    }
+}
+
+impl Drop for Transfer {
+    fn drop(&mut self) {
+        if let Ok(mut transfers) = transfers().lock() {
+            transfers.remove(&self.0);
+        }
+    }
+}
+
+/// File types Producer imports for each kind of media.
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "bmp"];
+const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
+const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "wav", "aac", "m4a", "flac", "ogg", "aiff"];
+
+/// Whether `path` has a file type Producer imports as the asset's kind.
+fn is_media_file(asset: &Asset, path: &std::path::Path) -> bool {
+    let allowed: &[&str] = match asset.kind {
+        AssetKind::Image => &IMAGE_EXTENSIONS,
+        AssetKind::Video => &VIDEO_EXTENSIONS,
+        AssetKind::Audio => &AUDIO_EXTENSIONS,
+        AssetKind::Unknown => return false,
+    };
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| allowed.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// SHA-256 of a file, remembered while its size and modified time stay the
+/// same, so a large original is read once however many subs fetch it.
+fn verified_checksum(path: &std::path::Path) -> Option<String> {
+    type Known = HashMap<PathBuf, (u64, std::time::SystemTime, String)>;
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    let metadata = fs::metadata(path).ok()?;
+    let stamp = (metadata.len(), metadata.modified().ok()?);
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some((len, modified, checksum)) = known.lock().ok()?.get(path) {
+        if (*len, *modified) == stamp {
+            return Some(checksum.clone());
+        }
+    }
+    let checksum = mapforge_core::sha256_file(path).ok()?;
+    known
+        .lock()
+        .ok()?
+        .insert(path.to_path_buf(), (stamp.0, stamp.1, checksum.clone()));
+    Some(checksum)
+}
+
+/// The file this Player may send to a sub for `asset`, or `None`. Shows
+/// arrive over the LAN without a password, so a show could name any file on
+/// this PC; only media of the asset's kind is sent. A copy in the media
+/// cache was checked when it arrived. The original path, used when the show
+/// was made on this PC, is sent only when its size and SHA-256 match the
+/// show, which a show naming some other file can't arrange.
+fn shareable_media(asset: &Asset) -> Option<PathBuf> {
+    let cached = cached_path(asset);
+    if cached.is_file() {
+        return is_media_file(asset, &cached).then_some(cached);
+    }
+    let original = PathBuf::from(&asset.path);
+    let metadata = fs::metadata(&original).ok()?;
+    let size_ok = asset.size_bytes.is_none_or(|size| size == metadata.len());
+    if !metadata.is_file() || !size_ok || !is_media_file(asset, &original) {
+        return None;
+    }
+    verified_checksum(&original)
+        .filter(|checksum| checksum.eq_ignore_ascii_case(&asset.checksum_sha256))
+        .map(|_| original)
+}
+
 /// A received copy wins over the original path, which usually only exists
 /// on the Producer PC.
 fn resolve_media(asset: &Asset) -> PathBuf {
@@ -1726,7 +1847,11 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
             http_response(stream, "200 OK", "application/json", &json);
         }
         ("POST", "/api/calibration") => {
-            if let Some(master) = shared.lock().unwrap().settings.master_http() {
+            // Read the master's address on its own line: a lock taken inside
+            // `if let` would stay held during the forward, freezing this PC's
+            // projectors and scheduler for the whole network round trip.
+            let master = shared.lock().unwrap().settings.master_http();
+            if let Some(master) = master {
                 match setup::forward_to_master(&master, "/api/calibration") {
                     Ok(()) => http_response(stream, "204 No Content", "text/plain", ""),
                     Err(e) => http_response(stream, "502 Bad Gateway", "text/plain", &e),
@@ -1770,7 +1895,8 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
                     return;
                 }
             };
-            if let Some(master) = shared.lock().unwrap().settings.master_http() {
+            let master = shared.lock().unwrap().settings.master_http();
+            if let Some(master) = master {
                 match setup::forward_to_master_json(&master, "/api/projector-order", &body) {
                     Ok(()) => http_response(stream, "204 No Content", "text/plain", ""),
                     Err(e) => http_response(stream, "502 Bad Gateway", "text/plain", &e),
@@ -1817,7 +1943,8 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
             }
         }
         ("POST", "/api/swap-positions") => {
-            if let Some(master) = shared.lock().unwrap().settings.master_http() {
+            let master = shared.lock().unwrap().settings.master_http();
+            if let Some(master) = master {
                 match setup::forward_to_master(&master, "/api/swap-positions") {
                     Ok(()) => http_response(stream, "204 No Content", "text/plain", ""),
                     Err(e) => http_response(stream, "502 Bad Gateway", "text/plain", &e),
@@ -1832,21 +1959,12 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
                     http_response(stream, "409 Conflict", "text/plain", "No show is loaded");
                     return;
                 };
-                let mut local: Vec<usize> = (0..project.outputs.len()).collect();
-                local.sort_by(|a, b| {
-                    project.outputs[*a].stage_y.total_cmp(&project.outputs[*b].stage_y)
-                        .then_with(|| project.outputs[*a].stage_x.total_cmp(&project.outputs[*b].stage_x))
-                });
-                if local.len() < 2 {
+                if !swap_first_two_positions(project) {
                     Err((
                         "409 Conflict",
                         "This Player needs at least two projectors to swap positions.".to_owned(),
                     ))
                 } else {
-                    let (first_index, second_index) = (local[0], local[1]);
-                    let (left, right) = project.outputs.split_at_mut(second_index);
-                    std::mem::swap(&mut left[first_index].stage_x, &mut right[0].stage_x);
-                    std::mem::swap(&mut left[first_index].stage_y, &mut right[0].stage_y);
                     project.auto_blend();
                     let updated = project.clone();
                     runtime.project_update_pending = true;
@@ -1988,6 +2106,31 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
     }
 }
 
+/// Swaps the stage positions of the first two projectors in reading order
+/// (top to bottom, left to right). Returns false when there are fewer than
+/// two. Reading order is not list order, so the positions are copied out
+/// and written back by index rather than splitting the list between them.
+fn swap_first_two_positions(project: &mut ShowProject) -> bool {
+    let mut order: Vec<usize> = (0..project.outputs.len()).collect();
+    order.sort_by(|a, b| {
+        let (a, b) = (&project.outputs[*a], &project.outputs[*b]);
+        a.stage_y
+            .total_cmp(&b.stage_y)
+            .then_with(|| a.stage_x.total_cmp(&b.stage_x))
+    });
+    let [first, second, ..] = order[..] else {
+        return false;
+    };
+    let place = |o: &ProjectorOutput| (o.stage_x, o.stage_y);
+    let first_place = place(&project.outputs[first]);
+    let second_place = place(&project.outputs[second]);
+    for (index, (x, y)) in [(first, second_place), (second, first_place)] {
+        project.outputs[index].stage_x = x;
+        project.outputs[index].stage_y = y;
+    }
+    true
+}
+
 fn projector_positions_json(runtime: &Runtime) -> String {
     let Some(project) = &runtime.project else {
         return serde_json::json!({ "outputs": [], "identifying": false }).to_string();
@@ -2023,7 +2166,11 @@ fn send_media(mut stream: TcpStream, path: &str, shared: &Mutex<Runtime>) {
             let project = runtime.project.as_ref()?;
             project.assets.iter().find(|a| a.id == id).cloned()
         });
-    let Some(file) = asset.and_then(|a| fs::File::open(resolve_media(&a)).ok()) else {
+    let file = asset
+        .as_ref()
+        .and_then(shareable_media)
+        .and_then(|path| fs::File::open(path).ok());
+    let Some(file) = file else {
         http_response(stream, "404 Not Found", "text/plain", "No such media here");
         return;
     };
@@ -2065,8 +2212,17 @@ fn receive_media(
         );
         return;
     };
+    let Some(_transfer) = Transfer::begin(&asset) else {
+        http_response(
+            stream,
+            "409 Conflict",
+            "text/plain",
+            "This file is already being received",
+        );
+        return;
+    };
     let target = cached_path(&asset);
-    let partial = target.with_extension("part");
+    let partial = partial_path(&asset);
     let result = (|| -> std::io::Result<String> {
         fs::create_dir_all(media_cache_dir())?;
         let mut file = std::io::BufWriter::new(fs::File::create(&partial)?);
@@ -2108,6 +2264,76 @@ fn receive_media(
         Err(e) => {
             let _ = fs::remove_file(&partial);
             http_response(stream, "400 Bad Request", "text/plain", &e.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn swapping_works_whatever_order_the_projectors_were_added_in() {
+        let mut project = ShowProject::default();
+        project.outputs[0].stage_x = 1920.0;
+        project.outputs[1].stage_x = 0.0;
+        for _ in 0..3 {
+            let before: Vec<f32> = project.outputs.iter().map(|o| o.stage_x).collect();
+            assert!(swap_first_two_positions(&mut project));
+            assert_eq!(project.outputs[0].stage_x, before[1]);
+            assert_eq!(project.outputs[1].stage_x, before[0]);
+        }
+        project.outputs.truncate(1);
+        assert!(!swap_first_two_positions(&mut project));
+    }
+
+    #[test]
+    fn each_transfer_writes_its_own_partial_file() {
+        let asset = asset_at("clip.mp4", AssetKind::Video, b"");
+        let (a, b) = (partial_path(&asset), partial_path(&asset));
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().ends_with(".part"));
+        let first = Transfer::begin(&asset).unwrap();
+        assert!(Transfer::begin(&asset).is_none());
+        drop(first);
+        assert!(Transfer::begin(&asset).is_some());
+    }
+
+    /// An asset whose original file holds `bytes`, or names `name` without
+    /// creating it when `bytes` is empty.
+    fn asset_at(name: &str, kind: AssetKind, bytes: &[u8]) -> Asset {
+        let id = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("mapforge-test-{id}-{name}"));
+        if !bytes.is_empty() {
+            fs::write(&path, bytes).unwrap();
+        }
+        Asset {
+            id,
+            path: path.to_string_lossy().into_owned(),
+            name: name.into(),
+            kind,
+            checksum_sha256: format!("{:x}", Sha256::digest(bytes)),
+            width: None,
+            height: None,
+            duration_seconds: None,
+            size_bytes: Some(bytes.len() as u64),
+        }
+    }
+
+    #[test]
+    fn only_real_show_media_is_sent_to_other_pcs() {
+        let video = asset_at("clip.mp4", AssetKind::Video, b"video bytes");
+        assert_eq!(shareable_media(&video), Some(PathBuf::from(&video.path)));
+        // A show naming some other file: wrong type, kind or contents.
+        let text = asset_at("passwords.txt", AssetKind::Video, b"secret");
+        assert_eq!(shareable_media(&text), None);
+        let unknown = asset_at("notes.mp4", AssetKind::Unknown, b"secret");
+        assert_eq!(shareable_media(&unknown), None);
+        let mut guessed = asset_at("photo.jpg", AssetKind::Image, b"private photo");
+        guessed.checksum_sha256 = "0".repeat(64);
+        assert_eq!(shareable_media(&guessed), None);
+        for asset in [video, text, unknown, guessed] {
+            let _ = fs::remove_file(&asset.path);
         }
     }
 }

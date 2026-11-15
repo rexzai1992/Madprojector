@@ -126,6 +126,10 @@ struct ScheduledStart {
     unix_ms: u64,
     scene_id: Uuid,
     seconds: f64,
+    /// Cued while the show was playing: the scene on air keeps playing
+    /// until the start time, then the cued media (pre-rolled in
+    /// `MediaPool::cue`) cuts in.
+    cut: bool,
 }
 
 fn is_loopback(address: &str) -> bool {
@@ -338,8 +342,10 @@ impl Runtime {
         }
     }
 
-    /// Whole-scene loops skip a leading blank interval on repeats. An
-    /// explicitly drawn timeline loop still uses its exact authored start.
+    /// Whole-scene loops skip a leading interval with no picture and no
+    /// sound on repeats; a music intro before the first picture is content
+    /// and plays on every pass. An explicitly drawn timeline loop still
+    /// uses its exact authored start.
     fn visual_loop_start(&self, scene: &Scene) -> f64 {
         let Some(project) = &self.project else {
             return 0.0;
@@ -353,7 +359,10 @@ impl Runtime {
                     .iter()
                     .find(|asset| asset.id == layer.asset_id)
                     .is_some_and(|asset| {
-                        matches!(asset.kind, AssetKind::Image | AssetKind::Video)
+                        matches!(
+                            asset.kind,
+                            AssetKind::Image | AssetKind::Video | AssetKind::Audio
+                        )
                     })
             })
             .map(|layer| layer.timeline_start.max(0.0))
@@ -388,8 +397,14 @@ impl Runtime {
         true
     }
 
-    fn play(&mut self, media: &MediaPool) {
+    /// Forgets a scheduled start and stops any media pre-rolled for it.
+    fn cancel_scheduled(&mut self, media: &MediaPool) {
         self.scheduled = None;
+        media.drop_cue();
+    }
+
+    fn play(&mut self, media: &MediaPool) {
+        self.cancel_scheduled(media);
         if self.state.scene_id.is_none() {
             let Some(first) = self.project.as_ref().and_then(|p| p.scenes.first()) else {
                 self.state.message = "No project loaded".into();
@@ -406,7 +421,7 @@ impl Runtime {
     }
 
     fn stop(&mut self, media: &MediaPool) {
-        self.scheduled = None;
+        self.cancel_scheduled(media);
         if let (Some(project), Some(scene_id)) = (&self.project, self.state.scene_id) {
             media.sync(project, scene_id, true, 0.0);
         }
@@ -417,11 +432,36 @@ impl Runtime {
     }
 
     fn schedule(&mut self, media: &MediaPool, scene_id: Uuid, seconds: f64, unix_ms: u64) {
-        if self.prepare(media, scene_id, seconds) {
+        if self.state.transport == Transport::Playing {
+            // Preparing now would stop the scene on air and leave the
+            // outputs black and silent for the whole lead time. Instead the
+            // cued media is pre-rolled beside it and cuts in at the start.
+            let Some(project) = &self.project else {
+                self.state.message = "No project loaded".into();
+                return;
+            };
+            if !project.scenes.iter().any(|s| s.id == scene_id) {
+                self.state.message = "Unknown scene".into();
+                return;
+            }
+            media.cue(project, scene_id, seconds);
             self.scheduled = Some(ScheduledStart {
                 unix_ms,
                 scene_id,
                 seconds,
+                cut: true,
+            });
+            self.state.start_error_ms = None;
+            self.state.message = format!("Cued; starts at {unix_ms}");
+            return;
+        }
+        if self.prepare(media, scene_id, seconds) {
+            media.drop_cue();
+            self.scheduled = Some(ScheduledStart {
+                unix_ms,
+                scene_id,
+                seconds,
+                cut: false,
             });
             self.state.start_error_ms = None;
             self.state.message = format!("Prepared; starts at {unix_ms}");
@@ -439,12 +479,26 @@ impl Runtime {
         self.scheduled = None;
         let late_ms = now.saturating_sub(start.unix_ms) as f64;
         let position = start.seconds + late_ms / 1000.0;
-        if self.state.scene_id != Some(start.scene_id) {
-            if !self.prepare(media, start.scene_id, position) {
+        // The media was started at `start.seconds`. When the start is late,
+        // the decoders and sound skip ahead to the show clock by themselves,
+        // so nothing is restarted for it.
+        if start.cut {
+            let Some(project) = &self.project else {
+                return;
+            };
+            if !project.scenes.iter().any(|s| s.id == start.scene_id) {
+                self.state.message = "Unknown scene".into();
+                return;
+            }
+            media.cut_to_cue(project, start.scene_id, start.seconds);
+            self.state.scene_id = Some(start.scene_id);
+            self.reset_loops(position);
+        } else if self.state.scene_id != Some(start.scene_id) {
+            if !self.prepare(media, start.scene_id, start.seconds) {
                 return;
             }
         } else if let Some(project) = &self.project {
-            media.sync(project, start.scene_id, late_ms > 40.0, position);
+            media.sync(project, start.scene_id, false, start.seconds);
         }
         self.clock = Clock {
             base: position,
@@ -457,7 +511,11 @@ impl Runtime {
 
     /// Applies the scene's end action once the clock passes its last clip.
     fn handle_scene_end(&mut self, media: &MediaPool) {
-        if self.state.transport != Transport::Playing {
+        // A cue is about to cut in: the outputs already wrap or hold this
+        // scene's end, and Stop or Next here would cancel the cue.
+        if self.state.transport != Transport::Playing
+            || self.scheduled.is_some_and(|start| start.cut)
+        {
             return;
         }
         let Some(scene) = self.scene() else {
@@ -545,6 +603,10 @@ struct LayerSpec {
     hidden: bool,
     /// Longest side after decoding: the GPU's limit and the quality setting.
     max_side: u32,
+    /// How many projector pixels the decoded part (`crop`, or the whole
+    /// picture) covers on this PC's outputs. Media larger than that is
+    /// shrunk while decoding, with a better filter than the GPU's.
+    shown: Option<[u32; 2]>,
 }
 
 impl LayerSpec {
@@ -557,6 +619,8 @@ impl LayerSpec {
             (Some(part), Some(w), Some(h)) if visual => media_crop(layer, part, w, h),
             _ => None,
         };
+        let shown_px =
+            shown.and_then(|_| shown_size(layer, outputs, crop, asset.width, asset.height));
         let uv = match (crop, asset.width, asset.height) {
             (Some([x, y, w, h]), Some(mw), Some(mh)) => [
                 x as f32 / mw as f32,
@@ -576,17 +640,98 @@ impl LayerSpec {
             uv,
             hidden: visual && shown.is_none(),
             max_side: max_side.min(texture_limit()),
+            shown: shown_px.filter(|_| visual),
         }
     }
 
-    /// Media position for show time `seconds`, wrapped for looping clips.
-    fn media_time(&self, seconds: f64) -> f64 {
-        let t = self.source_offset + (seconds - self.timeline_start).max(0.0);
+    /// Time into the media at show time `seconds`, counting on through
+    /// loops: the clock the decoders pace their frames against.
+    fn media_clock(&self, seconds: f64) -> f64 {
+        self.source_offset + (seconds - self.timeline_start).max(0.0)
+    }
+
+    /// Where in the file `media_clock` time `t` is: wrapped for looping
+    /// clips, and no further than the end for the rest, where a video
+    /// holds its last frame and sound has finished.
+    fn file_time(&self, t: f64) -> f64 {
         match self.asset.duration_seconds {
             Some(d) if self.looping && d > 0.0 => t % d,
+            Some(d) if d > 0.0 => t.min(d),
             _ => t,
         }
     }
+
+    /// Media position for show time `seconds`, as a place in the file.
+    #[cfg(test)]
+    fn media_time(&self, seconds: f64) -> f64 {
+        self.file_time(self.media_clock(seconds))
+    }
+}
+
+/// How many projector pixels the decoded part of a layer covers: its share
+/// of the layer's stage size, times the projector pixels per stage unit of
+/// the sharpest output on this PC that shows the layer.
+fn shown_size(
+    layer: &Layer,
+    outputs: &[&ProjectorOutput],
+    crop: Option<[u32; 4]>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Option<[u32; 2]> {
+    let (fx, fy) = match (crop, width, height) {
+        (Some([_, _, w, h]), Some(mw), Some(mh)) if mw > 0 && mh > 0 => {
+            (w as f32 / mw as f32, h as f32 / mh as f32)
+        }
+        _ => (1.0, 1.0),
+    };
+    let (mut px, mut py) = (0.0_f32, 0.0_f32);
+    for output in outputs.iter().filter(|o| layer.output_ids.contains(&o.id)) {
+        if output.stage_width > 0.0 && output.stage_height > 0.0 {
+            px = px.max(output.resolution[0] as f32 / output.stage_width);
+            py = py.max(output.resolution[1] as f32 / output.stage_height);
+        }
+    }
+    if px <= 0.0 || py <= 0.0 {
+        return None;
+    }
+    let even_up = |v: f32| ((v.ceil() as u32).div_ceil(2) * 2).max(2);
+    Some([
+        even_up(fx * layer.width * px),
+        even_up(fy * layer.height * py),
+    ])
+}
+
+/// Decode size for a `part` of the media shown on `shown` projector pixels:
+/// never larger than the media itself (FFmpeg never enlarges), no larger
+/// than it appears on screen, and within the quality and GPU limit.
+fn decode_size(part: (u32, u32), shown: Option<[u32; 2]>, max_side: u32) -> (usize, usize) {
+    let (w, h) = match shown {
+        Some([sw, sh]) => (part.0.min(sw), part.1.min(sh)),
+        None => part,
+    };
+    fit_within(w, h, max_side)
+}
+
+/// The crop `[x, y, w, h]`, given in pixels of media measured as `asset`,
+/// in pixels of the picture FFmpeg actually delivers (`frame`). The two
+/// differ for phone videos stored sideways with a rotation flag, which
+/// FFmpeg turns upright before cropping, or for shows probed before the
+/// flag was read. Edges stay even; `None` when the crop is unusable.
+fn crop_in_frame(crop: [u32; 4], asset: (u32, u32), frame: (u32, u32)) -> Option<[u32; 4]> {
+    let [x, y, w, h] = crop;
+    let (aw, ah) = (asset.0.max(1) as u64, asset.1.max(1) as u64);
+    let (fw, fh) = (frame.0 as u64, frame.1 as u64);
+    let lo = |v: u32, from: u64, to: u64| (v as u64 * to / from) as u32 / 2 * 2;
+    let hi = |v: u32, from: u64, to: u64| ((v as u64 * to).div_ceil(from) as u32).div_ceil(2) * 2;
+    let (x0, x1) = (lo(x, aw, fw), hi(x + w, aw, fw).min(frame.0));
+    let (y0, y1) = (lo(y, ah, fh), hi(y + h, ah, fh).min(frame.1));
+    if x1 < x0 + 2 || y1 < y0 + 2 {
+        return None;
+    }
+    if x0 == 0 && y0 == 0 && x1 >= frame.0 && y1 >= frame.1 {
+        return None;
+    }
+    Some([x0, y0, x1 - x0, y1 - y0])
 }
 
 /// The stage rectangle (left, top, right, bottom) where `outputs` show the
@@ -649,6 +794,46 @@ fn media_crop(layer: &Layer, part: [f32; 4], width: u32, height: u32) -> Option<
     Some([x0, y0, (x1 - x0).min(width - x0), (y1 - y0).min(height - y0)])
 }
 
+/// How far behind the show a decoder may fall before it starts FFmpeg again
+/// further on, rather than catching up by skipping frames.
+const RESYNC_SECONDS: f64 = 1.0;
+/// While a decoder catches up by skipping frames it still shows one at
+/// least this often, so the picture keeps moving.
+const MAX_HOLD: Duration = Duration::from_millis(100);
+
+/// What to do with a decoded frame, given when it is due and where the
+/// show is, both as media clock (`LayerSpec::media_clock`).
+#[derive(Debug, PartialEq)]
+enum Pace {
+    /// Not due yet; due in this many seconds.
+    Wait(f64),
+    Show,
+    /// The next frame is already due, so this one is skipped.
+    Drop,
+    /// Too far behind to catch up by skipping frames.
+    Resync,
+}
+
+fn pace(due: f64, clock: f64, held_long: bool) -> Pace {
+    let late = clock - due;
+    if late > RESYNC_SECONDS {
+        Pace::Resync
+    } else if late >= 1.0 / VIDEO_FPS && !held_long {
+        Pace::Drop
+    } else if late >= 0.0 {
+        Pace::Show
+    } else {
+        Pace::Wait(-late)
+    }
+}
+
+/// How one FFmpeg run of a video decoder ended.
+enum Run {
+    Cancelled,
+    Ended,
+    Resync,
+}
+
 #[derive(Default)]
 struct Decoder {
     latest: Mutex<Option<DecodedFrame>>,
@@ -658,6 +843,12 @@ struct Decoder {
     cancelled: AtomicBool,
     /// True while the show clock is inside this clip and playing.
     active: AtomicBool,
+    /// The show's place in the media (`LayerSpec::media_clock`) and when it
+    /// was read, set by the scheduler while the layer plays. Frames are
+    /// shown when the show reaches them, so the picture stays with the
+    /// clock, the sound and the other PCs however long FFmpeg takes to
+    /// start or seek, and however fast this PC decodes.
+    clock: Mutex<Option<(f64, Instant)>>,
 }
 
 impl Decoder {
@@ -675,17 +866,40 @@ impl Decoder {
         *self.error.lock().unwrap() = Some(message);
     }
 
+    fn set_clock(&self, media: f64) {
+        *self.clock.lock().unwrap() = Some((media, Instant::now()));
+    }
+
+    /// The show's place in the media now, carried on between the
+    /// scheduler's updates.
+    fn clock(&self) -> Option<f64> {
+        self.clock
+            .lock()
+            .unwrap()
+            .map(|(media, at)| media + at.elapsed().as_secs_f64())
+    }
+
     /// Describes the decode for the Player window: the source size, the part
     /// of it this PC shows, and whether it was scaled down.
-    fn describe(&self, spec: &LayerSpec, source: (u32, u32), decoded: (usize, usize)) {
+    fn describe(
+        &self,
+        spec: &LayerSpec,
+        source: (u32, u32),
+        part: Option<[u32; 4]>,
+        decoded: (usize, usize),
+    ) {
         let (sw, sh) = source;
-        let part = match spec.crop {
-            Some([_, _, w, h]) => format!("{w}×{h} part of {sw}×{sh}"),
+        let (cw, ch) = part.map_or((sw, sh), |[_, _, w, h]| (w, h));
+        let part = match part {
+            Some(_) => format!("{cw}×{ch} part of {sw}×{sh}"),
             None => format!("{sw}×{sh}"),
         };
-        let (cw, ch) = spec.crop.map_or((sw, sh), |[_, _, w, h]| (w, h));
+        let to_display = spec.shown.is_some_and(|[w, h]| w < cw || h < ch)
+            && decoded == decode_size((cw, ch), spec.shown, u32::MAX);
         let size = if decoded == (cw as usize, ch as usize) {
             "full resolution".to_owned()
+        } else if to_display {
+            format!("scaled to display size {}×{}", decoded.0, decoded.1)
         } else {
             format!("scaled down to {}×{}", decoded.0, decoded.1)
         };
@@ -697,22 +911,31 @@ impl Decoder {
         match image::open(&asset.path) {
             Ok(image) => {
                 let source = (image.width(), image.height());
-                let image = match spec.crop {
-                    Some([x, y, w, h]) if x + w <= image.width() && y + h <= image.height() => {
-                        image.crop_imm(x, y, w, h)
-                    }
-                    _ => image,
+                let part = spec
+                    .crop
+                    .filter(|[x, y, w, h]| x + w <= image.width() && y + h <= image.height());
+                let image = match part {
+                    Some([x, y, w, h]) => image.crop_imm(x, y, w, h),
+                    None => image,
                 };
-                let limit = spec.max_side;
-                let image = if image.width() > limit || image.height() > limit {
-                    let (w, h) = fit_within(image.width(), image.height(), limit);
-                    image.resize_exact(w as u32, h as u32, image::imageops::FilterType::Triangle)
+                let (w, h) =
+                    decode_size((image.width(), image.height()), spec.shown, spec.max_side);
+                // Never enlarged: rounding to even sizes may add a pixel.
+                let (w, h) = (
+                    (w as u32).min(image.width()),
+                    (h as u32).min(image.height()),
+                );
+                let image = if (w, h) != (image.width(), image.height()) {
+                    // Lanczos keeps fine detail and text crisp when
+                    // shrinking, where the GPU's bilinear sampling aliases.
+                    image.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
                 } else {
                     image
                 };
                 self.describe(
                     spec,
                     source,
+                    part,
                     (image.width() as usize, image.height() as usize),
                 );
                 let rgba = image.to_rgba8();
@@ -724,93 +947,203 @@ impl Decoder {
         }
     }
 
-    /// Streams RGBA frames from FFmpeg at a fixed rate. While inactive it
-    /// stops reading the pipe, which blocks FFmpeg, so playback resumes on
-    /// the same frame.
-    fn decode_video(&self, spec: &LayerSpec, start: f64) {
-        let asset = &spec.asset;
-        // The size comes from the show; a file Producer could not read is
-        // measured here rather than forced to 1280×720.
-        let (source_width, source_height) = match (asset.width, asset.height) {
-            (Some(w), Some(h)) if w >= 2 && h >= 2 => (w, h),
-            _ => probe_size(&asset.path).unwrap_or((1280, 720)),
-        };
-        // Only the part this PC shows is decoded; cropping is free in FFmpeg.
-        let (crop, part_width, part_height) = match spec.crop {
-            Some([x, y, w, h]) if x + w <= source_width && y + h <= source_height => {
-                (format!("crop={w}:{h}:{x}:{y},"), w, h)
+    /// Waits until the show reaches a frame due at media clock `due`, then
+    /// says whether to show it, skip it, or start FFmpeg again further on.
+    /// While paused or not yet playing the frame is held. `None` when the
+    /// decoder was cancelled meanwhile.
+    fn wait_until_due(&self, due: f64, last_shown: Instant) -> Option<Pace> {
+        loop {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return None;
             }
-            _ => (String::new(), source_width, source_height),
-        };
-        let (width, height) = fit_within(part_width, part_height, spec.max_side);
-        self.describe(spec, (source_width, source_height), (width, height));
-        let mut command = ffmpeg_input(&asset.path, spec.looping, start);
-        // The scale filter also does the RGBA conversion, so at the same size
-        // it costs nothing extra, and it pins the frame size read below even
-        // for odd-sized or rotated files.
-        command
-            .args([
-                "-an",
-                "-vf",
-                &format!("{crop}scale={width}:{height}"),
-                "-r",
-                &VIDEO_FPS.to_string(),
-                "-pix_fmt",
-                "rgba",
-                "-f",
-                "rawvideo",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                self.fail(format!("Could not start FFmpeg: {error}"));
-                return;
-            }
-        };
-        let Some(mut stdout) = child.stdout.take() else {
-            return;
-        };
-        let frame_time = Duration::from_secs_f64(1.0 / VIDEO_FPS);
-        let mut sequence = 0_u64;
-        let mut next_frame = Instant::now();
-        while !self.cancelled.load(Ordering::SeqCst) {
-            // The first frame is decoded straight away so a clip appears
-            // instantly when its time comes.
-            if sequence > 0 && !self.active.load(Ordering::SeqCst) {
+            let clock = self.clock().filter(|_| self.active.load(Ordering::SeqCst));
+            let Some(clock) = clock else {
                 thread::sleep(Duration::from_millis(5));
-                next_frame = Instant::now();
                 continue;
-            }
-            let mut rgba = vec![0_u8; width * height * 4];
-            if stdout.read_exact(&mut rgba).is_err() {
-                if sequence == 0 {
-                    self.fail(format!("{}: FFmpeg produced no frames", asset.name));
-                }
-                // A non-looping clip holds its last frame.
-                break;
-            }
-            sequence += 1;
-            // Video is opaque, so its bytes are already egui's premultiplied
-            // layout: this is a straight copy rather than a per-pixel multiply.
-            self.publish(egui::ColorImage::from_rgba_premultiplied([width, height], &rgba));
-            next_frame += frame_time;
-            let now = Instant::now();
-            if next_frame > now {
-                thread::sleep(next_frame - now);
-            } else if now - next_frame > Duration::from_millis(250) {
-                next_frame = now;
+            };
+            match pace(due, clock, last_shown.elapsed() >= MAX_HOLD) {
+                Pace::Wait(seconds) => thread::sleep(Duration::from_secs_f64(seconds.min(0.01))),
+                decision => return Some(decision),
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+    }
+
+    /// Streams RGBA frames from FFmpeg and shows each one when the show
+    /// clock reaches it: early frames wait, late ones are skipped, and a
+    /// decoder that falls far behind (a slow seek, a stall, a PC too slow
+    /// for the file) starts FFmpeg again where the show will be. While
+    /// inactive it stops reading the pipe, which blocks FFmpeg, so playback
+    /// resumes on the same frame. `start` is the media clock of the first
+    /// frame (`LayerSpec::media_clock`).
+    fn decode_video(&self, spec: &LayerSpec, start: f64) {
+        let asset = &spec.asset;
+        let known = match (asset.width, asset.height) {
+            (Some(w), Some(h)) if w >= 2 && h >= 2 => Some((w, h)),
+            _ => None,
+        };
+        // FFmpeg turns a video stored sideways with a rotation flag (phone
+        // clips) upright before any filter, so the crop and scale below
+        // work on the upright picture, whose size the file tells.
+        let source = probe_size(&asset.path).or(known).unwrap_or((1280, 720));
+        let (source_width, source_height) = source;
+        // Only the part this PC shows is decoded; cropping is free in FFmpeg.
+        let part = spec
+            .crop
+            .and_then(|c| crop_in_frame(c, known.unwrap_or(source), source));
+        let (crop, part_width, part_height) = match part {
+            Some([x, y, w, h]) => (format!("crop={w}:{h}:{x}:{y},"), w, h),
+            None => (String::new(), source_width, source_height),
+        };
+        let (width, height) = decode_size((part_width, part_height), spec.shown, spec.max_side);
+        self.describe(spec, source, part, (width, height));
+        // The scale filter also does the RGBA conversion, so at the same size
+        // it costs nothing extra, and it pins the frame size read below even
+        // for odd-sized files. Shrinking uses Lanczos with exact rounding and
+        // full chroma, which keeps fine detail and text crisp where the GPU's
+        // bilinear sampling of a larger texture would alias it.
+        let scale = if (width, height) == (part_width as usize, part_height as usize) {
+            format!("scale={width}:{height}")
+        } else {
+            format!("scale={width}:{height}:flags=lanczos+accurate_rnd+full_chroma_int")
+        };
+        let filter = format!("{crop}{scale}");
+        let frame_time = 1.0 / VIDEO_FPS;
+        // Media clock of this FFmpeg run's first frame.
+        let mut run_start = start;
+        // Reading only the end of the file, to hold its last frame.
+        let mut tail = false;
+        let mut published = false;
+        let mut last_shown = Instant::now();
+        // How long FFmpeg took to deliver its first frame: a restart aims
+        // that far ahead of the show.
+        let mut startup = 0.3_f64;
+        while !self.cancelled.load(Ordering::SeqCst) {
+            let mut command = if tail {
+                ffmpeg_tail(&asset.path)
+            } else {
+                ffmpeg_input(&asset.path, spec.looping, spec.file_time(run_start))
+            };
+            command
+                .args([
+                    "-an",
+                    "-vf",
+                    &filter,
+                    "-r",
+                    &VIDEO_FPS.to_string(),
+                    "-pix_fmt",
+                    "rgba",
+                    "-f",
+                    "rawvideo",
+                    "pipe:1",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let spawned = Instant::now();
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    self.fail(format!("Could not start FFmpeg: {error}"));
+                    return;
+                }
+            };
+            let Some(mut stdout) = child.stdout.take() else {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            };
+            let mut frames = 0_u64;
+            let mut last = None;
+            let run = loop {
+                if self.cancelled.load(Ordering::SeqCst) {
+                    break Run::Cancelled;
+                }
+                // The first frame is decoded straight away so a clip
+                // appears instantly when its time comes.
+                if published && !tail && !self.active.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let mut rgba = vec![0_u8; width * height * 4];
+                if stdout.read_exact(&mut rgba).is_err() {
+                    break Run::Ended;
+                }
+                if frames == 0 {
+                    startup = spawned.elapsed().as_secs_f64().clamp(0.05, 3.0);
+                }
+                let due = run_start + frames as f64 * frame_time;
+                frames += 1;
+                if tail {
+                    last = Some(rgba);
+                    continue;
+                }
+                if published {
+                    match self.wait_until_due(due, last_shown) {
+                        None => break Run::Cancelled,
+                        Some(Pace::Drop) => continue,
+                        Some(Pace::Resync) => break Run::Resync,
+                        Some(_) => {}
+                    }
+                }
+                // Video is opaque, so its bytes are already egui's premultiplied
+                // layout: this is a straight copy rather than a per-pixel multiply.
+                self.publish(egui::ColorImage::from_rgba_premultiplied(
+                    [width, height],
+                    &rgba,
+                ));
+                published = true;
+                last_shown = Instant::now();
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            match run {
+                Run::Cancelled => return,
+                Run::Resync => run_start = self.clock().unwrap_or(run_start) + startup,
+                Run::Ended if tail => {
+                    match last {
+                        Some(rgba) => self.publish(egui::ColorImage::from_rgba_premultiplied(
+                            [width, height],
+                            &rgba,
+                        )),
+                        None if !published => {
+                            self.fail(format!("{}: FFmpeg produced no frames", asset.name))
+                        }
+                        None => {}
+                    }
+                    return;
+                }
+                // Started at or past the end of a clip that plays once, as a
+                // seek or a cue into its held last frame does: show that
+                // last frame, as playing through to here would.
+                Run::Ended if frames == 0 && !spec.looping && spec.file_time(run_start) > 0.001 => {
+                    tail = true;
+                }
+                Run::Ended => {
+                    if frames == 0 && !published {
+                        self.fail(format!("{}: FFmpeg produced no frames", asset.name));
+                    }
+                    // A non-looping clip holds its last frame.
+                    return;
+                }
+            }
+        }
     }
 }
 
-/// The picture size of a video file, from FFprobe.
+/// The upright picture size of a video file, from FFprobe. Each file is
+/// probed once while it stays the same.
 fn probe_size(path: &str) -> Option<(u32, u32)> {
+    type Key = (String, u64, Option<std::time::SystemTime>);
+    static PROBED: OnceLock<Mutex<HashMap<Key, Option<(u32, u32)>>>> = OnceLock::new();
+    let meta = fs::metadata(path).ok();
+    let key = (
+        path.to_owned(),
+        meta.as_ref().map_or(0, |m| m.len()),
+        meta.and_then(|m| m.modified().ok()),
+    );
+    let probed = PROBED.get_or_init(Default::default);
+    if let Some(size) = probed.lock().unwrap().get(&key) {
+        return *size;
+    }
     let output = tool_command("ffprobe")
         .args([
             "-v",
@@ -818,17 +1151,40 @@ fn probe_size(path: &str) -> Option<(u32, u32)> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height",
+            "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
             "-of",
             "json",
         ])
         .arg(path)
         .output()
         .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let stream = value.get("streams")?.get(0)?;
+    let size = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .and_then(|value| upright_size(value.get("streams")?.get(0)?));
+    probed.lock().unwrap().insert(key, size);
+    size
+}
+
+/// A video stream's picture size as shown. Phones record portrait video as
+/// a landscape picture plus a rotation (a display matrix, or an older
+/// `rotate` tag), so a quarter turn swaps width and height.
+fn upright_size(stream: &serde_json::Value) -> Option<(u32, u32)> {
     let side = |key: &str| stream.get(key)?.as_u64().map(|v| v as u32);
-    Some((side("width")?, side("height")?))
+    let (width, height) = (side("width")?, side("height")?);
+    let number = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_str()?.trim().parse().ok());
+    let matrix = stream
+        .get("side_data_list")
+        .and_then(|list| list.as_array())
+        .and_then(|list| list.iter().find_map(|data| number(data.get("rotation")?)));
+    let tag = stream
+        .get("tags")
+        .and_then(|tags| number(tags.get("rotate")?));
+    let quarters = (matrix.or(tag).unwrap_or(0.0) / 90.0).round() as i64;
+    Some(if quarters.rem_euclid(2) == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    })
 }
 
 fn ffmpeg_input(path: &str, looping: bool, start: f64) -> ProcessCommand {
@@ -844,11 +1200,24 @@ fn ffmpeg_input(path: &str, looping: bool, start: f64) -> ProcessCommand {
     command
 }
 
+/// FFmpeg reading only the last second of a file, for its last frame.
+fn ffmpeg_tail(path: &str) -> ProcessCommand {
+    let mut command = tool_command("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-sseof", "-1"]);
+    command.arg("-i").arg(path);
+    command
+}
+
 /// Sound for one layer: FFmpeg decodes to 48 kHz stereo PCM, which a rodio
 /// sink plays. Pausing the sink stops pulling samples, so FFmpeg waits.
 struct AudioTrack {
     sink: rodio::Sink,
     cancelled: Arc<AtomicBool>,
+    /// Media clock (`LayerSpec::media_clock`) where the sound starts.
+    start: f64,
+    /// Samples the source skips to catch up with the show; see `PcmSource`.
+    late: Arc<AtomicU64>,
+    started: bool,
 }
 
 impl Drop for AudioTrack {
@@ -864,7 +1233,7 @@ impl AudioTrack {
         sink.pause();
         let (tx, rx) = mpsc::sync_channel::<Vec<i16>>(24);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut command = ffmpeg_input(&spec.asset.path, spec.looping, start);
+        let mut command = ffmpeg_input(&spec.asset.path, spec.looping, spec.file_time(start));
         command
             .args([
                 "-vn",
@@ -880,12 +1249,33 @@ impl AudioTrack {
             .stderr(Stdio::null());
         let worker_cancelled = cancelled.clone();
         thread::spawn(move || pump_audio(command, tx, &worker_cancelled));
+        let late = Arc::new(AtomicU64::new(0));
         sink.append(PcmSource {
             rx,
             chunk: Vec::new(),
             position: 0,
+            owed: 0,
+            late: late.clone(),
         });
-        Some(Self { sink, cancelled })
+        Some(Self {
+            sink,
+            cancelled,
+            start,
+            late,
+            started: false,
+        })
+    }
+
+    /// Plays with the show at media clock `clock`. The first time, sound
+    /// that starts late (a late scheduled start, a seek during playback)
+    /// skips ahead to the clock instead of trailing it for the whole clip.
+    fn play(&mut self, clock: f64) {
+        if !self.started {
+            self.started = true;
+            let frames = ((clock - self.start).max(0.0) * AUDIO_RATE as f64).round() as u64;
+            self.late.store(frames * 2, Ordering::SeqCst);
+        }
+        self.sink.play();
     }
 }
 
@@ -935,28 +1325,49 @@ fn pump_audio(mut command: ProcessCommand, tx: SyncSender<Vec<i16>>, cancelled: 
     let _ = child.wait();
 }
 
+/// Plays the PCM FFmpeg delivers and keeps it on the show clock. When
+/// FFmpeg is behind (starting up, a disk stall) it plays silence and later
+/// skips as much sound, so the sound never ends up late for good.
 struct PcmSource {
     rx: Receiver<Vec<i16>>,
     chunk: Vec<i16>,
     position: usize,
+    /// Samples still to skip to be back on the clock; always whole frames.
+    owed: u64,
+    /// Samples to skip, set by `AudioTrack::play` for a late start.
+    late: Arc<AtomicU64>,
 }
 
 impl Iterator for PcmSource {
     type Item = i16;
 
     fn next(&mut self) -> Option<i16> {
-        if self.position >= self.chunk.len() {
+        loop {
+            if self.position < self.chunk.len() {
+                let sample = self.chunk[self.position];
+                self.position += 1;
+                return Some(sample);
+            }
+            // Only at chunk ends, which are whole stereo frames, so the
+            // channels never swap.
+            self.owed += self.late.swap(0, Ordering::SeqCst) / 2 * 2;
             match self.rx.try_recv() {
-                Ok(chunk) => self.chunk = chunk,
-                // Decoder is behind: play one silent stereo frame.
-                Err(TryRecvError::Empty) => self.chunk = vec![0, 0],
+                Ok(chunk) => {
+                    let skip = (self.owed as usize).min(chunk.len()) / 2 * 2;
+                    self.owed -= skip as u64;
+                    self.chunk = chunk;
+                    self.position = skip;
+                }
+                // Decoder is behind: play one silent stereo frame, owed back.
+                Err(TryRecvError::Empty) => {
+                    self.chunk.clear();
+                    self.chunk.extend_from_slice(&[0, 0]);
+                    self.position = 0;
+                    self.owed += 2;
+                }
                 Err(TryRecvError::Disconnected) => return None,
             }
-            self.position = 0;
         }
-        let sample = self.chunk[self.position];
-        self.position += 1;
-        Some(sample)
     }
 }
 
@@ -995,6 +1406,9 @@ struct MediaPool {
     slots: Mutex<HashMap<Uuid, Slot>>,
     /// Media pre-rolled for the scene that plays next (or this one again).
     standby: Mutex<Option<(Uuid, f64, HashMap<Uuid, Slot>)>>,
+    /// Media pre-rolled for a scene cued during playback, kept apart from
+    /// `standby` so loops of the scene on air can't replace it.
+    cued: Mutex<Option<(Uuid, f64, HashMap<Uuid, Slot>)>>,
     audio_output: Option<rodio::OutputStreamHandle>,
     view: Mutex<DecodeView>,
 }
@@ -1096,8 +1510,41 @@ impl MediaPool {
         *standby = Some((scene_id, position, slots));
     }
 
+    /// Starts a cued scene's media on its first frame while the scene on
+    /// air keeps playing; `cut_to_cue` swaps it in at the start time.
+    fn cue(&self, project: &ShowProject, scene_id: Uuid, position: f64) {
+        let slots = self
+            .layer_specs(project, scene_id)
+            .into_iter()
+            .map(|(id, spec)| (id, self.start_slot(spec, position)))
+            .collect();
+        let old = self.cued.lock().unwrap().replace((scene_id, position, slots));
+        if let Some((_, _, old)) = old {
+            old.values().for_each(Slot::cancel);
+        }
+    }
+
+    fn drop_cue(&self) {
+        let old = self.cued.lock().unwrap().take();
+        if let Some((_, _, old)) = old {
+            old.values().for_each(Slot::cancel);
+        }
+    }
+
+    /// Makes the cued media the scene's media, as `sync` with `restart`.
+    fn cut_to_cue(&self, project: &ShowProject, scene_id: Uuid, position: f64) {
+        let cued = self.cued.lock().unwrap().take();
+        if let Some(cued) = cued {
+            let old = self.standby.lock().unwrap().replace(cued);
+            if let Some((_, _, old)) = old {
+                old.values().for_each(Slot::cancel);
+            }
+        }
+        self.sync(project, scene_id, true, position);
+    }
+
     fn start_slot(&self, spec: LayerSpec, position: f64) -> Slot {
-        let start = spec.media_time(position);
+        let start = spec.media_clock(position);
         let visual = matches!(spec.asset.kind, AssetKind::Image | AssetKind::Video);
         let video = (visual && !spec.hidden).then(|| {
             let decoder = Arc::new(Decoder::default());
@@ -1129,23 +1576,30 @@ impl MediaPool {
         if let Some((_, _, standby)) = self.standby.lock().unwrap().take() {
             standby.values().for_each(Slot::cancel);
         }
+        self.drop_cue();
     }
 
     /// Runs or pauses each layer's decoders for the current show time.
     fn update(&self, scene: Option<&Scene>, position: f64, playing: bool, master: f32) {
-        let slots = self.slots.lock().unwrap();
-        for (id, slot) in slots.iter() {
+        let mut slots = self.slots.lock().unwrap();
+        for (id, slot) in slots.iter_mut() {
             let layer = scene.and_then(|s| s.layers.iter().find(|l| l.id == *id));
             let active = playing && layer.is_some_and(|l| l.active_at(position));
+            let clock = slot.spec.media_clock(position);
             if let Some(video) = &slot.video {
+                // The clock is set before the decoder may run, so it never
+                // paces against an old one.
+                if active {
+                    video.set_clock(clock);
+                }
                 video.active.store(active, Ordering::SeqCst);
             }
-            if let Some(audio) = &slot.audio {
+            if let Some(audio) = &mut slot.audio {
                 audio
                     .sink
                     .set_volume(master * layer.map_or(0.0, |l| l.volume));
                 if active {
-                    audio.sink.play();
+                    audio.play(clock);
                 } else {
                     audio.sink.pause();
                 }
@@ -1470,14 +1924,14 @@ fn apply(runtime: &mut Runtime, envelope: Envelope, media: &MediaPool) {
         }
         Command::ReleaseLoop => runtime.release_loops(),
         Command::Pause => {
-            runtime.scheduled = None;
+            runtime.cancel_scheduled(media);
             runtime.clock.hold();
             runtime.state.transport = Transport::Paused;
             runtime.state.message = "Paused".into();
         }
         Command::Stop => runtime.stop(media),
         Command::Seek { seconds } => {
-            runtime.scheduled = None;
+            runtime.cancel_scheduled(media);
             let seconds = seconds.max(0.0);
             if let (Some(project), Some(scene_id)) = (&runtime.project, runtime.state.scene_id) {
                 media.sync(project, scene_id, true, seconds);
@@ -2770,19 +3224,29 @@ fn paint_output(
             return;
         }
     }
-    paint_correction(&painter, rect, output);
+    paint_correction(&painter, &map, output);
     paint_mask(&painter, rect, output);
 }
 
 fn paint_warped_color(painter: &egui::Painter, map: &OutputMapping, color: egui::Color32) {
+    paint_warped_rect(painter, map, [0.0, 0.0, 1.0, 1.0], color);
+}
+
+/// Fills `part` (left, top, right, bottom as fractions of the output,
+/// before warping) with `color`, warped like the picture.
+fn paint_warped_rect(
+    painter: &egui::Painter,
+    map: &OutputMapping,
+    part: [f32; 4],
+    color: egui::Color32,
+) {
     const SUBDIVISIONS: usize = 24;
     let mut mesh = egui::Mesh::default();
     for y in 0..=SUBDIVISIONS {
+        let v = egui::lerp(part[1]..=part[3], y as f32 / SUBDIVISIONS as f32);
         for x in 0..=SUBDIVISIONS {
-            mesh.colored_vertex(
-                map.normalized(x as f32 / SUBDIVISIONS as f32, y as f32 / SUBDIVISIONS as f32),
-                color,
-            );
+            let u = egui::lerp(part[0]..=part[2], x as f32 / SUBDIVISIONS as f32);
+            mesh.colored_vertex(map.normalized(u, v), color);
         }
     }
     let row = (SUBDIVISIONS + 1) as u32;
@@ -3003,29 +3467,51 @@ fn paint_grid(
     let stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
     let columns = 16;
     let rows = 9;
+    // Everything is drawn only where it crosses this output. Curved warps
+    // pin points outside the output to its border, which would draw false
+    // grid lines all along the edges.
+    let (x0, y0) = (output.stage_x, output.stage_y);
+    let (x1, y1) = (x0 + output.stage_width, y0 + output.stage_height);
+    let inside = |x: f32, y: f32| x >= x0 && x <= x1 && y >= y0 && y <= y1;
+    let (top, bottom) = (y0.max(0.0), y1.min(stage.height));
+    let (left, right) = (x0.max(0.0), x1.min(stage.width));
     for i in 0..=columns {
         let x = stage.width * i as f32 / columns as f32;
-        let points: Vec<_> = (0..=48).map(|step| map.point(x, stage.height * step as f32 / 48.0)).collect();
+        if x < x0 || x > x1 || bottom <= top {
+            continue;
+        }
+        let points: Vec<_> = (0..=48)
+            .map(|step| map.point(x, egui::lerp(top..=bottom, step as f32 / 48.0)))
+            .collect();
         painter.add(egui::Shape::line(points, stroke));
     }
     for i in 0..=rows {
         let y = stage.height * i as f32 / rows as f32;
-        let points: Vec<_> = (0..=48).map(|step| map.point(stage.width * step as f32 / 48.0, y)).collect();
+        if y < y0 || y > y1 || right <= left {
+            continue;
+        }
+        let points: Vec<_> = (0..=48)
+            .map(|step| map.point(egui::lerp(left..=right, step as f32 / 48.0), y))
+            .collect();
         painter.add(egui::Shape::line(points, stroke));
     }
-    let circle: Vec<_> = (0..=96)
-        .map(|step| {
-            let angle = std::f32::consts::TAU * step as f32 / 96.0;
-            map.point(
-                stage.width / 2.0 + angle.cos() * stage.height * 0.4,
-                stage.height / 2.0 + angle.sin() * stage.height * 0.4,
-            )
-        })
-        .collect();
-    painter.add(egui::Shape::line(
-        circle,
-        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 0)),
-    ));
+    let circle_stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 0));
+    let mut run = Vec::new();
+    for step in 0..=192 {
+        let angle = std::f32::consts::TAU * step as f32 / 192.0;
+        let x = stage.width / 2.0 + angle.cos() * stage.height * 0.4;
+        let y = stage.height / 2.0 + angle.sin() * stage.height * 0.4;
+        if inside(x, y) {
+            run.push(map.point(x, y));
+        } else if run.len() > 1 {
+            painter.add(egui::Shape::line(std::mem::take(&mut run), circle_stroke));
+        } else {
+            run.clear();
+        }
+    }
+    if run.len() > 1 {
+        painter.add(egui::Shape::line(run, circle_stroke));
+    }
     painter.text(
         map.rect.left_top() + egui::vec2(12.0, 12.0),
         egui::Align2::LEFT_TOP,
@@ -3036,67 +3522,89 @@ fn paint_grid(
 }
 
 /// Black-level lift, edge-blend feathers and brightness, in that order.
-fn paint_correction(painter: &egui::Painter, rect: egui::Rect, output: &ProjectorOutput) {
+/// Feather widths are stage pixels of content, so the lift and feathers
+/// are laid out before warping and go through the same mapping as the
+/// picture: on a keystoned or curved output they still cover exactly the
+/// overlapping content.
+fn paint_correction(painter: &egui::Painter, map: &OutputMapping, output: &ProjectorOutput) {
+    let rect = map.rect;
     let blend = &output.blend;
-    let left = blend.left / output.stage_width * rect.width();
-    let right = blend.right / output.stage_width * rect.width();
-    let top = blend.top / output.stage_height * rect.height();
-    let bottom = blend.bottom / output.stage_height * rect.height();
-
-    if output.color.black_lift > 0.0 {
-        let inner = egui::Rect::from_min_max(
-            rect.min + egui::vec2(left, top),
-            rect.max - egui::vec2(right, bottom),
-        );
-        if inner.is_positive() {
-            let alpha = (output.color.black_lift * 255.0).round() as u8;
-            painter.rect_filled(inner, 0.0, egui::Color32::from_white_alpha(alpha));
+    let share = |width: f32, of: f32| {
+        if of > 0.0 {
+            (width / of).clamp(0.0, 1.0)
+        } else {
+            0.0
         }
+    };
+    let left = share(blend.left, output.stage_width);
+    let right = share(blend.right, output.stage_width);
+    let top = share(blend.top, output.stage_height);
+    let bottom = share(blend.bottom, output.stage_height);
+
+    if output.color.black_lift > 0.0 && left + right < 1.0 && top + bottom < 1.0 {
+        let alpha = (output.color.black_lift * 255.0).round() as u8;
+        paint_warped_rect(
+            painter,
+            map,
+            [left, top, 1.0 - right, 1.0 - bottom],
+            egui::Color32::from_white_alpha(alpha),
+        );
     }
 
-    // Each feather is one gradient mesh; separate strips leave visible seams.
-    const STEPS: usize = 96;
-    for (edge, width) in [(0, left), (1, right), (2, top), (3, bottom)] {
-        if width <= 0.5 {
-            continue;
+    for (edge, share, pixels) in [
+        (0, left, left * rect.width()),
+        (1, right, right * rect.width()),
+        (2, top, top * rect.height()),
+        (3, bottom, bottom * rect.height()),
+    ] {
+        if pixels > 0.5 {
+            painter.add(feather_mesh(map, blend, edge, share));
         }
-        let mut mesh = egui::Mesh::default();
-        for step in 0..=STEPS {
-            let t = step as f32 / STEPS as f32;
-            let alpha = ((1.0 - blend.pixel(t)) * 255.0).round() as u8;
-            let color = egui::Color32::from_black_alpha(alpha);
-            let (a, b) = match edge {
-                0 => {
-                    let x = rect.left() + t * width;
-                    (egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom()))
-                }
-                1 => {
-                    let x = rect.right() - t * width;
-                    (egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom()))
-                }
-                2 => {
-                    let y = rect.top() + t * width;
-                    (egui::pos2(rect.left(), y), egui::pos2(rect.right(), y))
-                }
-                _ => {
-                    let y = rect.bottom() - t * width;
-                    (egui::pos2(rect.left(), y), egui::pos2(rect.right(), y))
-                }
-            };
-            mesh.colored_vertex(a, color);
-            mesh.colored_vertex(b, color);
-            if step > 0 {
-                let i = (step as u32) * 2;
-                mesh.add_triangle(i - 2, i - 1, i);
-                mesh.add_triangle(i - 1, i, i + 1);
-            }
-        }
-        painter.add(mesh);
     }
     if output.color.brightness < 1.0 {
         let alpha = ((1.0 - output.color.brightness) * 255.0).round() as u8;
         painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(alpha));
     }
+}
+
+/// One edge's feather (0 left, 1 right, 2 top, 3 bottom) covering `share`
+/// of the output, as one gradient mesh, since separate strips leave
+/// visible seams. It is subdivided along the edge too, so curved warps are
+/// followed.
+fn feather_mesh(
+    map: &OutputMapping,
+    blend: &mapforge_core::EdgeBlend,
+    edge: usize,
+    share: f32,
+) -> egui::Mesh {
+    const STEPS: usize = 96;
+    const ALONG: usize = 16;
+    let row = (ALONG + 1) as u32;
+    let mut mesh = egui::Mesh::default();
+    for step in 0..=STEPS {
+        let t = step as f32 / STEPS as f32;
+        let alpha = ((1.0 - blend.pixel(t)) * 255.0).round() as u8;
+        let color = egui::Color32::from_black_alpha(alpha);
+        let across = t * share;
+        for k in 0..=ALONG {
+            let along = k as f32 / ALONG as f32;
+            let (u, v) = match edge {
+                0 => (across, along),
+                1 => (1.0 - across, along),
+                2 => (along, across),
+                _ => (along, 1.0 - across),
+            };
+            mesh.colored_vertex(map.normalized(u, v), color);
+        }
+        if step > 0 {
+            let (a, b) = ((step as u32 - 1) * row, step as u32 * row);
+            for k in 0..ALONG as u32 {
+                mesh.add_triangle(a + k, a + k + 1, b + k + 1);
+                mesh.add_triangle(a + k, b + k + 1, b + k);
+            }
+        }
+    }
+    mesh
 }
 
 impl eframe::App for PlayerApp {
@@ -3452,6 +3960,11 @@ impl eframe::App for PlayerApp {
                         .show(ctx, |ui| {
                             paint_output(ui, index, project, state, output, textures)
                         });
+                    // A mouse left on a projector screen must not show up
+                    // on the projection.
+                    if fullscreen {
+                        ctx.set_cursor_icon(egui::CursorIcon::None);
+                    }
                     click
                 },
             );
@@ -3475,8 +3988,27 @@ impl eframe::App for PlayerApp {
                 }
             }
         }
+        wait_for_refresh();
     }
 }
+
+/// Waits once per round of output windows for the desktop to show its next
+/// refresh, so frames are evenly paced without vsync on every window.
+#[cfg(windows)]
+fn wait_for_refresh() {
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmFlush() -> i32;
+    }
+    // SAFETY: DwmFlush takes no arguments and only blocks until the desktop
+    // compositor's next frame; a failure just returns an error code.
+    unsafe {
+        DwmFlush();
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_refresh() {}
 
 fn main() -> eframe::Result<()> {
     let shared = Arc::new(Mutex::new(Runtime {
@@ -3489,6 +4021,7 @@ fn main() -> eframe::Result<()> {
     let media = Arc::new(MediaPool {
         slots: Mutex::new(HashMap::new()),
         standby: Mutex::new(None),
+        cued: Mutex::new(None),
         audio_output: open_audio_output(),
         view: Mutex::new(DecodeView {
             outputs: None,
@@ -3537,7 +4070,14 @@ fn main() -> eframe::Result<()> {
     };
     eframe::run_native(
         "MapForge Player",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            // Every projector output is its own window, and with vsync each
+            // window's buffer swap would wait for a refresh in turn, so two
+            // outputs would run at a third of the refresh rate. Frames are
+            // paced once per round instead (`wait_for_refresh`).
+            vsync: false,
+            ..Default::default()
+        },
         Box::new(|cc| {
             // Media is decoded at the largest size this GPU can show.
             if let Some(gl) = &cc.gl {
@@ -3878,5 +4418,221 @@ mod screen_plan_tests {
         let chosen = HashMap::from([(a, None)]);
         let plan = plan_screens(&monitors, &project, &None, &chosen);
         assert_eq!(plan[&a].display, None);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    fn asset(kind: AssetKind, width: u32, height: u32) -> Asset {
+        Asset {
+            id: Uuid::new_v4(),
+            path: "clip.mov".into(),
+            name: "clip.mov".into(),
+            kind,
+            checksum_sha256: String::new(),
+            width: Some(width),
+            height: Some(height),
+            duration_seconds: Some(10.0),
+            size_bytes: None,
+        }
+    }
+
+    fn layer(asset: &Asset, output: &ProjectorOutput, width: f32, height: f32) -> Layer {
+        Layer {
+            id: Uuid::new_v4(),
+            asset_id: asset.id,
+            name: "clip".into(),
+            x: output.stage_x,
+            y: output.stage_y,
+            width,
+            height,
+            opacity: 1.0,
+            output_ids: vec![output.id],
+            timeline_start: 0.0,
+            timeline_duration: 15.0,
+            source_offset: 0.0,
+            looping: false,
+            volume: 1.0,
+            audio: true,
+        }
+    }
+
+    #[test]
+    fn media_larger_than_its_place_on_screen_is_decoded_at_display_size() {
+        let mut project = ShowProject::default();
+        project.lock_output_sizes();
+        let output = &project.outputs[0];
+        let uhd = asset(AssetKind::Video, 3840, 2160);
+        let layer = layer(&uhd, output, 1920.0, 1080.0);
+        let spec = LayerSpec::new(&layer, &uhd, &[output], u32::MAX);
+        assert_eq!(spec.crop, None);
+        assert_eq!(spec.shown, Some([1920, 1080]));
+        assert_eq!(
+            decode_size((3840, 2160), spec.shown, spec.max_side),
+            (1920, 1080)
+        );
+        // The quality cap still applies on top.
+        assert_eq!(decode_size((3840, 2160), spec.shown, 1280), (1280, 720));
+        // Never enlarged: small media keeps its own size.
+        assert_eq!(decode_size((1280, 720), spec.shown, u32::MAX), (1280, 720));
+    }
+
+    #[test]
+    fn display_size_counts_projector_pixels_not_stage_units() {
+        // The default show maps 1020 stage units onto 1920 projector pixels.
+        let project = ShowProject::default();
+        let output = &project.outputs[0];
+        let uhd = asset(AssetKind::Image, 3840, 2160);
+        let layer = layer(&uhd, output, 1020.0, 1080.0);
+        let spec = LayerSpec::new(&layer, &uhd, &[output], u32::MAX);
+        assert_eq!(spec.shown, Some([1920, 1080]));
+    }
+
+    #[test]
+    fn a_non_looping_clip_is_never_started_past_its_end() {
+        let project = ShowProject::default();
+        let output = &project.outputs[0];
+        let clip = asset(AssetKind::Video, 1920, 1080);
+        let mut layer = layer(&clip, output, 1920.0, 1080.0);
+        let spec = LayerSpec::new(&layer, &clip, &[output], u32::MAX);
+        assert_eq!(spec.media_time(12.0), 10.0);
+        assert_eq!(spec.media_clock(12.0), 12.0);
+        layer.looping = true;
+        let spec = LayerSpec::new(&layer, &clip, &[output], u32::MAX);
+        assert!((spec.media_time(12.0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn frames_are_shown_when_the_show_reaches_them() {
+        let frame = 1.0 / VIDEO_FPS;
+        assert!(matches!(pace(5.0, 4.99, false), Pace::Wait(w) if (w - 0.01).abs() < 1e-9));
+        assert_eq!(pace(5.0, 5.0 + frame / 2.0, false), Pace::Show);
+        // The next frame is due already: skip this one to catch up...
+        assert_eq!(pace(5.0, 5.0 + frame * 1.5, false), Pace::Drop);
+        // ...unless the picture has not moved for a while.
+        assert_eq!(pace(5.0, 5.0 + frame * 1.5, true), Pace::Show);
+        // Far behind: start again further on.
+        assert_eq!(pace(5.0, 5.0 + RESYNC_SECONDS + 0.1, true), Pace::Resync);
+    }
+
+    #[test]
+    fn rotated_videos_report_their_upright_size() {
+        let matrix = serde_json::json!({
+            "width": 1920, "height": 1080,
+            "side_data_list": [{ "rotation": -90 }]
+        });
+        assert_eq!(upright_size(&matrix), Some((1080, 1920)));
+        let tag = serde_json::json!({ "width": 1920, "height": 1080, "tags": { "rotate": "270" } });
+        assert_eq!(upright_size(&tag), Some((1080, 1920)));
+        let flipped =
+            serde_json::json!({ "width": 1920, "height": 1080, "tags": { "rotate": "180" } });
+        assert_eq!(upright_size(&flipped), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn a_crop_measured_on_the_stored_picture_lands_inside_the_upright_one() {
+        // Measured on a 1920×1080 sideways file, delivered as 1080×1920.
+        let crop = crop_in_frame([700, 0, 1200, 1080], (1920, 1080), (1080, 1920)).unwrap();
+        let [x, y, w, h] = crop;
+        assert!(x + w <= 1080 && y + h <= 1920, "{crop:?}");
+        assert_eq!((x % 2, w % 2), (0, 0));
+        assert!(x <= 394 && x + w >= 1069);
+        // Same sizes: the crop is kept as it is.
+        assert_eq!(
+            crop_in_frame([100, 0, 1000, 1080], (1920, 1080), (1920, 1080)),
+            Some([100, 0, 1000, 1080])
+        );
+    }
+
+    #[test]
+    fn late_or_starved_sound_catches_up_with_the_clock() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let late = Arc::new(AtomicU64::new(0));
+        let mut source = PcmSource {
+            rx,
+            chunk: Vec::new(),
+            position: 0,
+            owed: 0,
+            late: late.clone(),
+        };
+        // Nothing decoded yet: one silent stereo frame, owed back later.
+        assert_eq!((source.next(), source.next()), (Some(0), Some(0)));
+        tx.send(vec![1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(source.next(), Some(3));
+        assert_eq!(source.next(), Some(4));
+        // A late start skips that much sound.
+        late.store(2, Ordering::SeqCst);
+        source.next();
+        source.next();
+        tx.send(vec![7, 8, 9, 10]).unwrap();
+        assert_eq!(source.next(), Some(9));
+    }
+
+    #[test]
+    fn feathers_follow_the_warp() {
+        let mut output = ShowProject::default().outputs.remove(0);
+        output.blend.left = 255.0;
+        let share = output.blend.left / output.stage_width;
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1920.0, 1080.0));
+        // Unwarped: the inner edge sits where it always did.
+        let mesh = feather_mesh(&OutputMapping::new(rect, &output), &output.blend, 0, share);
+        let inner = mesh.vertices.last().unwrap().pos;
+        assert!((inner.x - share * 1920.0).abs() < 0.01);
+        assert!((inner.y - 1080.0).abs() < 0.01);
+        // Keystoned: the inner edge is where that content is drawn.
+        output.warp_mode = WarpMode::Perspective;
+        output.warp_corners = [[0.0, 0.0], [0.92, 0.05], [1.0, 1.0], [0.05, 0.95]];
+        let map = OutputMapping::new(rect, &output);
+        let mesh = feather_mesh(&map, &output.blend, 0, share);
+        for (k, vertex) in mesh.vertices.iter().rev().take(17).enumerate() {
+            let y = output.stage_y + output.stage_height * (16 - k) as f32 / 16.0;
+            let expected = map.point(output.stage_x + output.blend.left, y);
+            assert!(vertex.pos.distance(expected) < 0.01);
+        }
+    }
+
+    #[test]
+    fn a_cue_during_playback_keeps_the_scene_on_air_until_its_start() {
+        let mut project = ShowProject::default();
+        project.scenes.push(Scene::new("Scene 2"));
+        let (first, second) = (project.scenes[0].id, project.scenes[1].id);
+        let media = MediaPool::default();
+        let mut runtime = Runtime {
+            project: Some(project),
+            ..Default::default()
+        };
+        runtime.play(&media);
+        assert_eq!(runtime.state.scene_id, Some(first));
+        runtime.schedule(&media, second, 0.0, unix_time_ms() + 60_000);
+        assert_eq!(runtime.state.scene_id, Some(first));
+        assert_eq!(runtime.state.transport, Transport::Playing);
+        assert!(media.cued.lock().unwrap().is_some());
+        runtime.scheduled.as_mut().unwrap().unix_ms = unix_time_ms().saturating_sub(5);
+        runtime.handle_scheduled_start(&media);
+        assert_eq!(runtime.state.scene_id, Some(second));
+        assert_eq!(runtime.state.transport, Transport::Playing);
+        assert!(runtime.clock.position() >= 0.004);
+        assert!(media.cued.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn scene_loops_keep_a_sound_only_intro() {
+        let mut project = ShowProject::default();
+        let output = project.outputs[0].clone();
+        let music = asset(AssetKind::Audio, 0, 0);
+        let video = asset(AssetKind::Video, 1920, 1080);
+        let bed = layer(&music, &output, 1.0, 1.0);
+        let mut picture = layer(&video, &output, 1920.0, 1080.0);
+        picture.timeline_start = 3.0;
+        project.assets = vec![music, video];
+        project.scenes[0].layers = vec![bed, picture];
+        let runtime = Runtime {
+            project: Some(project),
+            ..Default::default()
+        };
+        let scene = &runtime.project.as_ref().unwrap().scenes[0];
+        assert_eq!(runtime.visual_loop_start(scene), 0.0);
     }
 }

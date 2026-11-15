@@ -130,6 +130,10 @@ struct ScheduledStart {
     /// until the start time, then the cued media (pre-rolled in
     /// `MediaPool::cue`) cuts in.
     cut: bool,
+    /// An exit-loop arrived while this cut was waiting. It is meant for the
+    /// cued position, so it is applied when the cut happens; applying it at
+    /// once would be undone when the cut re-arms the loops.
+    release: bool,
 }
 
 fn is_loopback(address: &str) -> bool {
@@ -271,7 +275,15 @@ impl Runtime {
 
     /// Lets every loop around the current position play through.
     fn release_loops(&mut self) {
-        let position = self.clock.position();
+        if let Some(start) = self.scheduled.as_mut().filter(|s| s.cut) {
+            start.release = true;
+            self.state.message = "Leaving loop at the cue".into();
+            return;
+        }
+        self.release_loops_at(self.clock.position());
+    }
+
+    fn release_loops_at(&mut self, position: f64) {
         let ids: Vec<(Uuid, String)> = self
             .scene()
             .map(|s| {
@@ -450,6 +462,7 @@ impl Runtime {
                 scene_id,
                 seconds,
                 cut: true,
+                release: false,
             });
             self.state.start_error_ms = None;
             self.state.message = format!("Cued; starts at {unix_ms}");
@@ -462,6 +475,7 @@ impl Runtime {
                 scene_id,
                 seconds,
                 cut: false,
+                release: false,
             });
             self.state.start_error_ms = None;
             self.state.message = format!("Prepared; starts at {unix_ms}");
@@ -493,6 +507,9 @@ impl Runtime {
             media.cut_to_cue(project, start.scene_id, start.seconds);
             self.state.scene_id = Some(start.scene_id);
             self.reset_loops(position);
+            if start.release {
+                self.release_loops_at(position);
+            }
         } else if self.state.scene_id != Some(start.scene_id) {
             if !self.prepare(media, start.scene_id, start.seconds) {
                 return;
@@ -4615,6 +4632,37 @@ mod render_tests {
         assert_eq!(runtime.state.transport, Transport::Playing);
         assert!(runtime.clock.position() >= 0.004);
         assert!(media.cued.lock().unwrap().is_none());
+    }
+
+    /// The master re-cues a follower and then releases its loop: the release
+    /// belongs to the cued position, not to where the follower still is.
+    #[test]
+    fn an_exit_loop_during_a_pending_cue_applies_at_the_cut() {
+        let mut project = ShowProject::default();
+        let region = LoopRegion {
+            id: Uuid::new_v4(),
+            name: "Hold".into(),
+            start: 10.0,
+            end: 20.0,
+            count: 0,
+            hotkey: String::new(),
+            exit_hotkey: String::new(),
+            button: Default::default(),
+        };
+        project.scenes[0].loops.push(region.clone());
+        let scene = project.scenes[0].id;
+        let media = MediaPool::default();
+        let mut runtime = Runtime {
+            project: Some(project),
+            ..Default::default()
+        };
+        runtime.play(&media);
+        runtime.schedule(&media, scene, 12.0, unix_time_ms() + 60_000);
+        runtime.release_loops();
+        assert!(runtime.armed(&region), "nothing is released before the cut");
+        runtime.scheduled.as_mut().unwrap().unix_ms = unix_time_ms().saturating_sub(5);
+        runtime.handle_scheduled_start(&media);
+        assert!(!runtime.armed(&region), "the loop is released once the cue lands");
     }
 
     #[test]

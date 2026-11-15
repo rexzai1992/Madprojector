@@ -4031,7 +4031,31 @@ fn wait_for_refresh() {
 #[cfg(not(windows))]
 fn wait_for_refresh() {}
 
+/// Keeps Windows from turning the screens off, starting a screen saver or
+/// going to sleep while the Player is open. A show PC gets no mouse or
+/// keyboard input for hours, so without this the projectors go dark after
+/// the PC's display timeout while the show keeps playing unseen. It lasts
+/// as long as the calling thread, so it is called on the main thread.
+#[cfg(windows)]
+fn keep_screens_awake() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetThreadExecutionState(flags: u32) -> u32;
+    }
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+    const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    // SAFETY: takes plain flags and only changes this thread's power request.
+    unsafe {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+    }
+}
+
+#[cfg(not(windows))]
+fn keep_screens_awake() {}
+
 fn main() -> eframe::Result<()> {
+    keep_screens_awake();
     let shared = Arc::new(Mutex::new(Runtime {
         settings: setup::load_settings(),
         port: port_setting("MAPFORGE_PORT", DEFAULT_PLAYER_PORT),

@@ -768,6 +768,9 @@ impl ProducerApp {
                 self.project = project;
                 self.project_path = (!player_copy).then_some(path);
                 self.sync_overlap_percent();
+                // Start the layout tool at this show's projector count, so
+                // "Arrange" does not remove projectors until asked to.
+                self.layout_count = self.project.outputs.len().max(1);
                 self.scene = 0;
                 self.selected_layer = None;
                 self.selected_output = None;
@@ -2708,11 +2711,15 @@ impl ProducerApp {
                     {
                         remove = Some(output.id);
                     }
-                    ui.label(
-                        RichText::new(display_player_host(&mapforge_core::player_host(&address)))
-                            .small()
-                            .monospace()
-                            .color(if up { LIVE } else { DANGER }),
+                    // Cut short in a narrow panel rather than drawn over the name.
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(display_player_host(&mapforge_core::player_host(&address)))
+                                .small()
+                                .monospace()
+                                .color(if up { LIVE } else { DANGER }),
+                        )
+                        .truncate(),
                     )
                     .on_hover_text(if up {
                         "Player online"
@@ -4026,7 +4033,8 @@ impl eframe::App for ProducerApp {
             .show(ctx, |ui| self.left_panel(ui));
         egui::SidePanel::right("properties")
             .resizable(true)
-            .default_width(300.0)
+            // Wide enough for a projector's name, size and PC address on one line.
+            .default_width(380.0)
             .show(ctx, |ui| self.right_panel(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.preview_ui(ui));
 
@@ -4309,11 +4317,13 @@ fn pattern_name(pattern: TestPattern) -> &'static str {
 /// Edits a stage-pixel feather width as a percentage of `total`.
 fn percent_slider(ui: &mut egui::Ui, value: &mut f32, total: f32, label: &str) {
     let mut percent = *value / total * 100.0;
+    // One decimal is shown, but the slider must not round the width itself:
+    // that narrowed a blend just by opening this section.
     let response = ui.add(
         egui::Slider::new(&mut percent, 0.0..=50.0)
             .text(label)
             .suffix("%")
-            .fixed_decimals(1),
+            .custom_formatter(|v, _| format!("{v:.1}")),
     );
     if response.changed() {
         *value = (percent / 100.0 * total).clamp(0.0, total);
@@ -4799,6 +4809,21 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn showing_a_blend_width_leaves_it_alone() {
+        // 120 of 1920 px is 6.25%: more decimals than the slider shows.
+        let mut width = 120.0_f32;
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    percent_slider(ui, &mut width, 1920.0, "Right");
+                });
+            });
+        }
+        assert_eq!(width, 120.0);
+    }
 
     #[test]
     fn probe_swaps_size_of_rotated_video() {

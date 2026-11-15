@@ -147,11 +147,42 @@ pub fn follow_master(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>) {
             }
             Err(error) => {
                 wait = (wait * 2).min(Duration::from_secs(30));
-                format!("Can't sync with the master at {http}: {error}")
+                match master_moved(&http, &shared) {
+                    Some(note) => {
+                        wait = Duration::from_secs(2);
+                        note
+                    }
+                    None => format!("Can't sync with the master at {http}: {error}"),
+                }
             }
         };
         shared.lock().unwrap().link_note = note;
     }
+}
+
+/// The master does not answer at its saved address. When exactly one
+/// master is announcing itself on this network at another address (the
+/// router gave that PC a new one), the sub follows it there and remembers
+/// the new address. Returns a line for the operator when it did.
+fn master_moved(http: &str, shared: &Mutex<Runtime>) -> Option<String> {
+    if connect(http, Duration::from_secs(2)).is_ok() {
+        return None; // reachable: the trouble is something else
+    }
+    let master = crate::discover::only_master()?;
+    let mut runtime = shared.lock().unwrap();
+    let saved = runtime.settings.master.trim();
+    let saved_host = saved.rsplit_once(':').map_or(saved, |(host, _)| host);
+    if saved_host == master.host {
+        return None;
+    }
+    runtime.settings.master = master.host.clone();
+    if let Err(e) = save_settings(&runtime.settings) {
+        return Some(format!("Found the Master at {}, but could not save it: {e}", master.host));
+    }
+    Some(format!(
+        "The Master ({}) has a new address, {}. Following it there.",
+        master.name, master.host
+    ))
 }
 
 fn sync_with_master(

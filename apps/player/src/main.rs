@@ -1,6 +1,7 @@
 // Release builds on Windows open no console window next to the app.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod discover;
 mod displays;
 mod relay;
 mod setup;
@@ -2294,6 +2295,9 @@ fn http_server(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>, relay: Arc<Re
     // Players on the venue LAN without asking the operator for an IP address.
     // Keep the daemon alive for as long as the HTTP listener is running.
     let _discovery = advertise_controller(port);
+    if let Some(daemon) = &_discovery {
+        discover::start(daemon, format!("MapForge {}", bonjour_name()));
+    }
     let listener = TcpListener::bind(("0.0.0.0", port))
         .unwrap_or_else(|_| panic!("HTTP port {port} is unavailable"));
     // One thread per request, so a large upload never blocks the controller.
@@ -2305,7 +2309,9 @@ fn http_server(shared: Arc<Mutex<Runtime>>, media: Arc<MediaPool>, relay: Arc<Re
     }
 }
 
-fn advertise_controller(port: u16) -> Option<ServiceDaemon> {
+/// This PC's name as it is announced on the network: the Windows computer
+/// name in a form Bonjour accepts.
+fn bonjour_name() -> String {
     let computer = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "player".to_owned());
@@ -2317,7 +2323,16 @@ fn advertise_controller(port: u16) -> Option<ServiceDaemon> {
         .collect::<String>()
         .trim_matches('-')
         .to_ascii_lowercase();
-    let host = if host.is_empty() { "player" } else { &host };
+    if host.is_empty() {
+        "player".to_owned()
+    } else {
+        host
+    }
+}
+
+fn advertise_controller(port: u16) -> Option<ServiceDaemon> {
+    let host = bonjour_name();
+    let host = host.as_str();
     let instance = format!("MapForge {host}");
     let hostname = format!("{host}.local.");
     let daemon = match ServiceDaemon::new() {
@@ -2328,7 +2343,7 @@ fn advertise_controller(port: u16) -> Option<ServiceDaemon> {
         }
     };
     let info = match ServiceInfo::new(
-        "_mapforge._tcp.local.",
+        discover::SERVICE,
         &instance,
         &hostname,
         "",
@@ -2440,6 +2455,11 @@ fn handle_http(mut stream: TcpStream, shared: &Mutex<Runtime>, media: &MediaPool
         }
         ("GET", "/api/controller") => {
             let json = controller_json(&shared.lock().unwrap());
+            http_response(stream, "200 OK", "application/json", &json);
+        }
+        // The MapForge Players this PC has found on the network.
+        ("GET", "/api/players") => {
+            let json = serde_json::to_string(&discover::found()).unwrap();
             http_response(stream, "200 OK", "application/json", &json);
         }
         ("GET", "/api/projectors") => {
@@ -3148,6 +3168,33 @@ impl PlayerApp {
                 ));
             }
             Some(PlayerRole::Sub) => {
+                let masters: Vec<discover::Found> = discover::found()
+                    .into_iter()
+                    .filter(|f| !f.this_pc && f.role == Some(PlayerRole::Master))
+                    .collect();
+                if masters.is_empty() {
+                    ui.label("Looking for a Master PC on this network…");
+                    ui.small("Open MapForge Player on the Master PC and set it to Master. Or type its IP below.");
+                } else {
+                    // With one master on the network there is nothing to
+                    // choose: it is filled in, and Save is all that is left.
+                    if masters.len() == 1 && draft.master.trim().is_empty() {
+                        draft.master = masters[0].host.clone();
+                    }
+                    ui.label(if masters.len() == 1 {
+                        "Master PC found on this network:"
+                    } else {
+                        "Master PCs found on this network. Click the one to follow:"
+                    });
+                    for master in &masters {
+                        let chosen = draft.master.trim() == master.host;
+                        let mark = if chosen { "✔ " } else { "" };
+                        let text = format!("{mark}{}  ·  {}", master.name, master.host);
+                        if ui.add(egui::Button::new(text).selected(chosen)).clicked() {
+                            draft.master = master.host.clone();
+                        }
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label("Master PC IP");
                     ui.add(
@@ -3873,6 +3920,21 @@ impl eframe::App for PlayerApp {
                 }
             });
             ui.label(format!("This PC's IP: {}", self.ip));
+            let others: Vec<String> = discover::found()
+                .into_iter()
+                .filter(|f| !f.this_pc)
+                .map(|f| {
+                    let role = match f.role {
+                        Some(PlayerRole::Master) => "Master",
+                        Some(PlayerRole::Sub) => "Sub",
+                        None => "not set up",
+                    };
+                    format!("{} ({}, {role})", f.name, f.host)
+                })
+                .collect();
+            if !others.is_empty() {
+                ui.label(format!("Other MapForge PCs on this network: {}", others.join(" · ")));
+            }
             if settings.role == Some(PlayerRole::Master) {
                 let followers: Vec<String> = state
                     .followers

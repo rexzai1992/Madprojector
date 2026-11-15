@@ -708,10 +708,16 @@ impl ShowProject {
             else {
                 continue;
             };
+            // Same name and, when the show knows it, the same size: another
+            // file that happens to share the name is not taken.
+            let size = asset.size_bytes;
             let here = std::iter::once(folder.to_path_buf())
                 .chain(subfolders.iter().cloned())
                 .map(|dir| dir.join(name))
-                .find(|candidate| candidate.is_file());
+                .find(|candidate| {
+                    fs::metadata(candidate)
+                        .is_ok_and(|m| m.is_file() && size.is_none_or(|s| s == m.len()))
+                });
             if let Some(path) = here {
                 asset.path = path.to_string_lossy().into_owned();
                 found += 1;
@@ -726,16 +732,21 @@ impl ShowProject {
     /// pair of neighbours: the whole picture goes soft. Whole-pixel
     /// positions keep media at its native size pixel-for-pixel sharp.
     pub fn snap_to_pixels(&mut self) {
+        // Halves always round up. `f32::round` rounds them away from zero,
+        // which moved a layer's left and right edges in opposite directions
+        // when it started left of the canvas at a half pixel, making it one
+        // pixel wider than its media and so no longer pixel for pixel.
+        let snap = |v: f32| (v + 0.5).floor();
         for output in &mut self.outputs {
-            output.stage_x = output.stage_x.round();
-            output.stage_y = output.stage_y.round();
+            output.stage_x = snap(output.stage_x);
+            output.stage_y = snap(output.stage_y);
         }
         for layer in self.scenes.iter_mut().flat_map(|s| s.layers.iter_mut()) {
             let (right, bottom) = (layer.x + layer.width, layer.y + layer.height);
-            layer.x = layer.x.round();
-            layer.y = layer.y.round();
-            layer.width = (right.round() - layer.x).max(1.0);
-            layer.height = (bottom.round() - layer.y).max(1.0);
+            layer.x = snap(layer.x);
+            layer.y = snap(layer.y);
+            layer.width = (snap(right) - layer.x).max(1.0);
+            layer.height = (snap(bottom) - layer.y).max(1.0);
         }
     }
 
@@ -850,6 +861,16 @@ pub fn load_project(path: &Path) -> Result<ShowProject> {
         project.find_media_in(folder);
     }
     Ok(project)
+}
+
+/// Whether `path` is a Player's own copy of a show (`current-show.json`),
+/// which wraps the show with that Player's projectors. Saving a plain show
+/// over it would leave the Player without a show at its next start.
+pub fn is_player_copy(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|value| value.get("scenes").is_none() && value.get("project").is_some())
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
@@ -1083,6 +1104,13 @@ mod tests {
         assert_eq!(Path::new(&p.assets[0].path), folder.join("bali.mov"));
         assert_eq!(Path::new(&p.assets[1].path), folder.join("videos").join("tokyo.mov"));
         assert_eq!(p.assets[2].path, r"Q:\nowhere\missing.mov", "left as it was");
+        // A file of the same name but another size is someone else's file.
+        let mut other = ShowProject::default();
+        other.assets = vec![asset(r"Q:\x\bali.mov")];
+        other.assets[0].size_bytes = Some(999);
+        assert_eq!(other.find_media_in(&folder), 0);
+        other.assets[0].size_bytes = Some(1);
+        assert_eq!(other.find_media_in(&folder), 1);
         // A file that is where the show says stays there.
         let kept = p.assets[0].path.clone();
         assert_eq!(p.find_media_in(&folder), 0);
@@ -1094,6 +1122,9 @@ mod tests {
         fs::write(&file, serde_json::to_vec(&serde_json::json!({ "project": p })).unwrap()).unwrap();
         let opened = load_project(&file).unwrap();
         assert_eq!(Path::new(&opened.assets[0].path), folder.join("bali.mov"));
+        assert!(is_player_copy(&file));
+        fs::write(&file, serde_json::to_vec(&p).unwrap()).unwrap();
+        assert!(!is_player_copy(&file));
         let _ = fs::remove_dir_all(&folder);
     }
 
@@ -1126,6 +1157,13 @@ mod tests {
         assert_eq!((layer.x, layer.y), (-2639.0, 0.0));
         // Media keeps its native size, so it maps pixel for pixel.
         assert_eq!((layer.width, layer.height), (10600.0, 1080.0));
+        // Also from a half pixel left of the canvas, where rounding each
+        // edge away from zero used to add a pixel.
+        let layer = &mut p.scenes.last_mut().unwrap().layers[0];
+        (layer.x, layer.width) = (-320.5, 2561.0);
+        p.snap_to_pixels();
+        let layer = &p.scenes.last().unwrap().layers[0];
+        assert_eq!((layer.x, layer.width), (-320.0, 2561.0));
     }
 
     #[test]

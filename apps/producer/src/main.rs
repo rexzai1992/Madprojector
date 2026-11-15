@@ -503,6 +503,18 @@ impl ProducerApp {
         }
     }
 
+    /// The operator asked for the show to be sent: every Player gets it,
+    /// also one that Producer believes already has it (it may have opened
+    /// another show by itself) or that turned it down before.
+    fn send_to_all(&mut self) {
+        for link in &mut self.links {
+            link.synced = None;
+            link.rejected = None;
+            link.status.lock().unwrap().unreachable = false;
+        }
+        self.sync_now();
+    }
+
     /// Sends the show to every Player that needs it, with the projectors
     /// assigned to it.
     fn sync_now(&mut self) {
@@ -743,10 +755,18 @@ impl ProducerApp {
 
     fn open_path(&mut self, path: PathBuf) {
         match load_project(&path) {
-            Ok(project) => {
+            Ok(mut project) => {
+                // The editor keeps projectors at their native size and
+                // everything on whole pixels. Doing that before taking the
+                // saved copy keeps an untouched show from reading "unsaved".
+                project.lock_output_sizes();
+                project.snap_to_pixels();
+                // A Player's own copy has another shape; saving over it
+                // would leave that Player without a show. Use Save As.
+                let player_copy = mapforge_core::is_player_copy(&path);
                 self.last_saved = project.clone();
                 self.project = project;
-                self.project_path = Some(path);
+                self.project_path = (!player_copy).then_some(path);
                 self.sync_overlap_percent();
                 self.scene = 0;
                 self.selected_layer = None;
@@ -1830,7 +1850,7 @@ impl ProducerApp {
                 ui.checkbox(&mut self.live_sync, "Live sync")
                     .on_hover_text("Send every change to the Players immediately");
                 if ui.button("Send show to all Players now").clicked() {
-                    self.sync_now();
+                    self.send_to_all();
                 }
             },
         );
@@ -3531,7 +3551,7 @@ impl ProducerApp {
             .on_hover_text("Each Player saves it and opens it next time it starts")
             .clicked()
         {
-            self.sync_now();
+            self.send_to_all();
             self.status = format!("Show sent to {} Player(s)", self.links.len());
         }
     }

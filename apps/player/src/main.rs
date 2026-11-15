@@ -1286,7 +1286,13 @@ fn apply(runtime: &mut Runtime, envelope: Envelope, media: &MediaPool) {
             runtime.seen.remove(&id);
         }
     }
-    match envelope.command {
+    let mut command = envelope.command;
+    // Shows saved before positions snapped to whole pixels may hold
+    // fractional ones, which blur media; every show is snapped on arrival.
+    if let Command::LoadProject { project, .. } = &mut command {
+        project.snap_to_pixels();
+    }
+    match command {
         Command::LoadProject {
             project,
             outputs,

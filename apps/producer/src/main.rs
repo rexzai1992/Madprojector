@@ -4123,6 +4123,11 @@ impl eframe::App for ProducerApp {
 
         self.project.lock_output_sizes();
         let pointer_down = ctx.input(|i| i.pointer.any_down());
+        // Drags move freely and land on whole pixels when released, so media
+        // stays pixel-sharp on the projectors.
+        if !pointer_down {
+            self.project.snap_to_pixels();
+        }
         self.history.track(&self.project, pointer_down);
         self.auto_sync();
     }

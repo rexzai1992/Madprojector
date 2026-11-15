@@ -679,6 +679,25 @@ impl ShowProject {
         players
     }
 
+    /// Moves projectors and layer edges onto whole canvas pixels. A canvas
+    /// pixel is a projector pixel, so media placed at a fractional position
+    /// lands between projector pixels and the GPU's filtering blends each
+    /// pair of neighbours: the whole picture goes soft. Whole-pixel
+    /// positions keep media at its native size pixel-for-pixel sharp.
+    pub fn snap_to_pixels(&mut self) {
+        for output in &mut self.outputs {
+            output.stage_x = output.stage_x.round();
+            output.stage_y = output.stage_y.round();
+        }
+        for layer in self.scenes.iter_mut().flat_map(|s| s.layers.iter_mut()) {
+            let (right, bottom) = (layer.x + layer.width, layer.y + layer.height);
+            layer.x = layer.x.round();
+            layer.y = layer.y.round();
+            layer.width = (right.round() - layer.x).max(1.0);
+            layer.height = (bottom.round() - layer.y).max(1.0);
+        }
+    }
+
     /// A projector is a physical device: its area on the canvas is always
     /// its native resolution, so it can be moved but never stretched.
     pub fn lock_output_sizes(&mut self) {
@@ -964,6 +983,37 @@ mod tests {
         }
         assert_eq!(blend.light(0.0), 0.0);
         assert_eq!(blend.light(1.0), 1.0);
+    }
+
+    #[test]
+    fn positions_snap_to_whole_pixels() {
+        let mut p = ShowProject::default();
+        p.outputs[0].stage_x = 1932.66;
+        let mut scene = Scene::new("A");
+        scene.layers.push(Layer {
+            id: Uuid::new_v4(),
+            asset_id: Uuid::new_v4(),
+            name: "pan".into(),
+            x: -2639.115,
+            y: 0.4,
+            width: 10600.0,
+            height: 1080.0,
+            opacity: 1.0,
+            output_ids: vec![],
+            timeline_start: 0.0,
+            timeline_duration: 10.0,
+            source_offset: 0.0,
+            looping: false,
+            volume: 1.0,
+            audio: true,
+        });
+        p.scenes.push(scene);
+        p.snap_to_pixels();
+        assert_eq!(p.outputs[0].stage_x, 1933.0);
+        let layer = &p.scenes.last().unwrap().layers[0];
+        assert_eq!((layer.x, layer.y), (-2639.0, 0.0));
+        // Media keeps its native size, so it maps pixel for pixel.
+        assert_eq!((layer.width, layer.height), (10600.0, 1080.0));
     }
 
     #[test]

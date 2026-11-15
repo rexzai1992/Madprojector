@@ -1,0 +1,28 @@
+name: iOS controller
+
+# Compiles the iPhone/iPad controller on a GitHub Mac so Swift errors show up
+# even when the change was made on Windows. Unsigned: install it on a device
+# from Xcode with your own Apple ID.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["apps/ios/**", ".github/workflows/ios-controller.yml"]
+  pull_request:
+    paths: ["apps/ios/**"]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build for the iOS simulator
+        run: |
+          xcodebuild \
+            -project apps/ios/MapForgeController/MapForgeController.xcodeproj \
+            -target MapForgeController \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build

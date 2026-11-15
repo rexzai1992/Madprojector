@@ -1,7 +1,11 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 pub mod net;
@@ -679,6 +683,43 @@ impl ShowProject {
         players
     }
 
+    /// Makes a show folder portable. A show file stores where each media
+    /// file was on the PC that built the show; when the folder is copied to
+    /// another PC or drive those places no longer exist. Media that is
+    /// missing is looked for by file name in `folder` (the show file's own
+    /// folder) and in the folders directly inside it. Returns how many
+    /// files were found that way.
+    pub fn find_media_in(&mut self, folder: &Path) -> usize {
+        let subfolders: Vec<PathBuf> = fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .take(64)
+            .collect();
+        let mut found = 0;
+        for asset in &mut self.assets {
+            if Path::new(&asset.path).is_file() {
+                continue;
+            }
+            // The saved path may come from Windows even when read elsewhere.
+            let Some(name) = asset.path.rsplit(['\\', '/']).next().filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            let here = std::iter::once(folder.to_path_buf())
+                .chain(subfolders.iter().cloned())
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file());
+            if let Some(path) = here {
+                asset.path = path.to_string_lossy().into_owned();
+                found += 1;
+            }
+        }
+        found
+    }
+
     /// Moves projectors and layer edges onto whole canvas pixels. A canvas
     /// pixel is a projector pixel, so media placed at a fractional position
     /// lands between projector pixels and the GPU's filtering blends each
@@ -796,8 +837,18 @@ pub fn load_project(path: &Path) -> Result<ShowProject> {
     if metadata.len() > 32 * 1024 * 1024 {
         bail!("project file is larger than 32 MiB");
     }
-    let project: ShowProject = serde_json::from_slice(&fs::read(path)?)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    // A Player's saved copy wraps the show as {"project": ...}.
+    if value.get("scenes").is_none() {
+        if let Some(inner) = value.get_mut("project") {
+            value = inner.take();
+        }
+    }
+    let mut project: ShowProject = serde_json::from_value(value)?;
     project.validate()?;
+    if let Some(folder) = path.parent() {
+        project.find_media_in(folder);
+    }
     Ok(project)
 }
 
@@ -1001,6 +1052,49 @@ mod tests {
         }
         assert_eq!(blend.light(0.0), 0.0);
         assert_eq!(blend.light(1.0), 1.0);
+    }
+
+    /// A show folder copied to another PC: the saved Windows paths are
+    /// gone, but the videos sit next to the show file or one folder below.
+    #[test]
+    fn media_is_found_next_to_the_show_file() {
+        let folder = std::env::temp_dir().join(format!("mapforge-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(folder.join("videos")).unwrap();
+        fs::write(folder.join("bali.mov"), b"x").unwrap();
+        fs::write(folder.join("videos").join("tokyo.mov"), b"x").unwrap();
+        let asset = |path: &str| Asset {
+            id: Uuid::new_v4(),
+            path: path.into(),
+            name: "clip".into(),
+            kind: AssetKind::Video,
+            checksum_sha256: String::new(),
+            width: None,
+            height: None,
+            duration_seconds: None,
+            size_bytes: None,
+        };
+        let mut p = ShowProject::default();
+        p.assets = vec![
+            asset(r"Q:\Someone\Desktop\Show\bali.mov"),
+            asset(r"Q:\old\tokyo.mov"),
+            asset(r"Q:\nowhere\missing.mov"),
+        ];
+        assert_eq!(p.find_media_in(&folder), 2);
+        assert_eq!(Path::new(&p.assets[0].path), folder.join("bali.mov"));
+        assert_eq!(Path::new(&p.assets[1].path), folder.join("videos").join("tokyo.mov"));
+        assert_eq!(p.assets[2].path, r"Q:\nowhere\missing.mov", "left as it was");
+        // A file that is where the show says stays there.
+        let kept = p.assets[0].path.clone();
+        assert_eq!(p.find_media_in(&folder), 0);
+        assert_eq!(p.assets[0].path, kept);
+        // The show file itself opens, bare or wrapped as a Player saves it.
+        p.assets.truncate(1);
+        p.assets[0].path = r"Q:\gone\bali.mov".into();
+        let file = folder.join("show.mapforge.json");
+        fs::write(&file, serde_json::to_vec(&serde_json::json!({ "project": p })).unwrap()).unwrap();
+        let opened = load_project(&file).unwrap();
+        assert_eq!(Path::new(&opened.assets[0].path), folder.join("bali.mov"));
+        let _ = fs::remove_dir_all(&folder);
     }
 
     #[test]

@@ -2003,21 +2003,127 @@ fn save_show(project: &ShowProject, outputs: &Option<Vec<Uuid>>, player: &Option
     let _ = saver.send(json);
 }
 
-/// Opens the show this Player last received. Returns whether it should start
-/// playing by itself.
-fn open_saved_show(shared: &Mutex<Runtime>, media: &MediaPool) -> bool {
+/// Opens a show file from a folder on this PC, so a show PC needs only the
+/// folder with the show file and its media, not Producer. Media that is not
+/// where the file says is looked for next to the file. The file is
+/// remembered for the next start. Returns a line for the operator.
+fn open_show_file(
+    shared: &Mutex<Runtime>,
+    media: &MediaPool,
+    path: &std::path::Path,
+) -> Result<String, String> {
+    if shared.lock().unwrap().role() == Some(PlayerRole::Sub) {
+        return Err("This PC is a Sub and gets its show from the Master. Open the show file on the Master.".into());
+    }
+    let project = mapforge_core::load_project(path).map_err(|e| e.to_string())?;
+    let name = project.name.clone();
+    let missing: Vec<String> = project
+        .assets
+        .iter()
+        .filter(|a| !asset_status(a).ready)
+        .map(|a| a.name.clone())
+        .collect();
+    let (outputs, player) = {
+        let runtime = shared.lock().unwrap();
+        let me = project.players().into_iter().find(|a| runtime.is_me(a));
+        let outputs = me.as_ref().map(|me| {
+            project
+                .outputs
+                .iter()
+                .filter(|o| &o.player_address() == me)
+                .map(|o| o.id)
+                .collect::<Vec<_>>()
+        });
+        (outputs, me)
+    };
+    apply_local(
+        shared,
+        media,
+        Command::LoadProject {
+            project,
+            outputs,
+            player,
+        },
+    );
+    let mut runtime = shared.lock().unwrap();
+    runtime.settings.show_file = Some(path.to_string_lossy().into_owned());
+    if let Err(e) = setup::save_settings(&runtime.settings) {
+        runtime.state.message = format!("Could not remember the show file: {e}");
+    }
+    let line = if missing.is_empty() {
+        format!("Opened {name} from {}", path.display())
+    } else {
+        format!(
+            "Opened {name}, but {} media file(s) are not in its folder: {}",
+            missing.len(),
+            missing.join(", ")
+        )
+    };
+    runtime.state.message = line.clone();
+    Ok(line)
+}
+
+/// Opens the show for this start: the show file chosen on this PC when it
+/// has been replaced since the Player last saved its copy, otherwise the
+/// copy the Player keeps. Returns whether it should start playing by itself.
+fn open_show_at_start(shared: &Mutex<Runtime>, media: &MediaPool) -> bool {
+    let modified = |path: &std::path::Path| fs::metadata(path).and_then(|m| m.modified()).ok();
+    // A show file given on the command line (or dropped on the icon) wins.
+    let argument = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let chosen = shared
+        .lock()
+        .unwrap()
+        .settings
+        .show_file
+        .clone()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let replaced = chosen.as_ref().is_some_and(|file| {
+        match (modified(file), modified(&saved_show_path())) {
+            (Some(file), Some(saved)) => file > saved,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    });
+    let from_file = argument.or_else(|| chosen.clone().filter(|_| replaced));
+    if let Some(file) = from_file {
+        match open_show_file(shared, media, &file) {
+            Ok(_) => {
+                let runtime = shared.lock().unwrap();
+                return runtime.is_master() && runtime.settings.autoplay;
+            }
+            Err(e) => shared.lock().unwrap().state.message = format!("Could not open {}: {e}", file.display()),
+        }
+    }
+    open_saved_show(shared, media, chosen.as_deref().and_then(|file| file.parent()))
+}
+
+/// Opens the show this Player last received. Media that has moved is looked
+/// for in `folder`, the folder of the show file opened on this PC. Returns
+/// whether it should start playing by itself.
+fn open_saved_show(
+    shared: &Mutex<Runtime>,
+    media: &MediaPool,
+    folder: Option<&std::path::Path>,
+) -> bool {
     #[derive(Deserialize)]
     struct SavedShow {
         project: ShowProject,
         outputs: Option<Vec<Uuid>>,
         player: Option<String>,
     }
-    let Some(saved) = fs::read_to_string(saved_show_path())
+    let Some(mut saved) = fs::read_to_string(saved_show_path())
         .ok()
         .and_then(|json| serde_json::from_str::<SavedShow>(&json).ok())
     else {
         return false;
     };
+    if let Some(folder) = folder {
+        saved.project.find_media_in(folder);
+    }
     apply_local(
         shared,
         media,
@@ -3628,9 +3734,52 @@ fn feather_mesh(
     mesh
 }
 
+impl PlayerApp {
+    /// Asks for a show file and opens it. The dialog runs on its own thread
+    /// so the projector outputs keep drawing while it is open.
+    fn pick_show_file(&self, ctx: egui::Context) {
+        let (shared, media) = (self.shared.clone(), self.media.clone());
+        thread::spawn(move || {
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Open a MapForge show file")
+                .add_filter("MapForge show", &["json"])
+                .pick_file()
+            else {
+                return;
+            };
+            if let Err(e) = open_show_file(&shared, &media, &path) {
+                shared.lock().unwrap().state.message = format!("Could not open the show: {e}");
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// A show file dropped on the Player window is opened like one picked
+    /// with the button.
+    fn open_dropped_show(&self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                })
+        });
+        if let Some(path) = dropped {
+            if let Err(e) = open_show_file(&self.shared, &self.media, &path) {
+                self.shared.lock().unwrap().state.message =
+                    format!("Could not open the show: {e}");
+            }
+        }
+    }
+}
+
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.update_textures(ctx);
+        self.open_dropped_show(ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
         if mapforge_core::update::bubble::show(ctx, &mut self.updater, None) {
             // The installer is open and replaces the programs once we close.
@@ -3725,6 +3874,21 @@ impl eframe::App for PlayerApp {
             }
             if !link_note.is_empty() {
                 ui.label(link_note);
+            }
+            if settings.role != Some(PlayerRole::Sub) {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Open show file…")
+                        .on_hover_text(
+                            "Run a show from a folder on this PC: the show file with its \
+                             videos beside it. Producer is not needed.",
+                        )
+                        .clicked()
+                    {
+                        self.pick_show_file(ui.ctx().clone());
+                    }
+                    ui.small("or drop the show file on this window");
+                });
             }
             if !plays_audio {
                 ui.label("Sound: off on this PC (it plays on the master)");
@@ -4090,7 +4254,7 @@ fn main() -> eframe::Result<()> {
         let r = relay.clone();
         thread::spawn(move || r.run(s));
     }
-    if open_saved_show(&shared, &media) {
+    if open_show_at_start(&shared, &media) {
         let s = shared.clone();
         let m = media.clone();
         let r = relay.clone();

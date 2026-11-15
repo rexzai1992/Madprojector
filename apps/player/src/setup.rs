@@ -36,6 +36,10 @@ pub struct PlayerSettings {
     pub displays: HashMap<Uuid, Option<u32>>,
     /// How large video and pictures are decoded on this PC.
     pub quality: Quality,
+    /// The show file last opened on this PC with "Open show file". Its
+    /// folder is where media is looked for, and the file is opened again
+    /// at start-up when it has been replaced since.
+    pub show_file: Option<String>,
 }
 
 /// The largest size media is decoded at on this PC. Full resolution is the
